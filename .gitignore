@@ -1,0 +1,28 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+dance_env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Output files (generated clips)
+output/segments/
+output/low_score_clips/
+
+# Model file (auto-downloaded)
+pose_landmarker_lite.task
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
