@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "🚀 运行舞蹈评分系统",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/dance_scoring.py",
+            "console": "integratedTerminal",
+            "args": [
+                "-r", "videos/reference.mp4",
+                "-u", "videos/user.mp4"
+            ],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
