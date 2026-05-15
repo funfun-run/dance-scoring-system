@@ -9,15 +9,24 @@ __pycache__/
 *.pyc
 *.pyo
 
+# User video files
+videos/
+
 # Output files (generated clips)
-output/segments/
-output/low_score_clips/
+output/
 
 # Model file (auto-downloaded)
 pose_landmarker_lite.task
 
 # Claude Code
 .claude/
+.agents/
+skills-lock.json
+
+# Process artifacts
+code_review.html
+audit_report.html
+AI开发路线纠正任务清单.md
 
 # IDE
 .vscode/
