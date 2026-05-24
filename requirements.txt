@@ -1,0 +1,7 @@
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+openvino>=2024.0.0
+mediapipe>=0.10.32
+librosa>=0.10.0
+madmom>=0.16.1
