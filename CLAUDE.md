@@ -4,25 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Dance scoring system v1.0 (舞蹈评分系统) that compares a user's dance video against a reference video using MediaPipe pose landmark detection, joint-angle analysis, DTW (Dynamic Time Warping) alignment, and segment-based scoring. The system outputs a terminal score report and generates slow-motion practice clips for segments scored below a configurable threshold.
+Dance scoring system v2.0 — 基于嵌入式边缘计算的舞蹈分段跟练与姿态纠错系统. Target hardware: Intel DK-2500 (Core Ultra 5 225U + NPU), deployment OS: Ubuntu 22.04 + OpenVINO. Compares a user's dance video against a reference video using MediaPipe pose landmark detection, joint-angle analysis, DTW alignment, fastdtw, and segment-based scoring. Outputs a terminal score report, generates slow-motion practice clips, and pinpoints weak body parts for corrective feedback.
 
 ## Commands
 
 ```bash
-# Run the main dance scoring system
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4
+# Offline scoring
+python scripts/score.py -r <reference.mp4> -u <user.mp4>
 
-# Run with a custom score threshold (default 50)
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4 -t 60
+# Custom score threshold (default 50)
+python scripts/score.py -r <reference.mp4> -u <user.mp4> -t 60
 
-# Split reference video into 8-beat slow-motion segments
-python scripts/split.py -r assets/videos/reference.mp4
+# 8-beat video segmentation
+python scripts/split.py -r <reference.mp4>
 
-# Split with custom BPM
-python scripts/split.py -r assets/videos/reference.mp4 -b 100
+# Custom BPM
+python scripts/split.py -r <reference.mp4> -b 100
 
 # Launch GUI
 python src/dance_scoring/gui/app.py
+
+# Live camera practice (placeholder)
+python scripts/run_live.py
 ```
 
 ## Dependencies
@@ -33,26 +36,32 @@ The project uses the `.venv` virtual environment. Install dependencies before ru
 pip install -r requirements.txt
 ```
 
-The MediaPipe pose landmarker model is auto-downloaded on first run (~5.6 MB) to `assets/model/`. No manual model setup is needed.
+The MediaPipe pose landmarker model is auto-downloaded on first run (~5.6 MB) to `~/.cache/dance_scoring/`. No manual model setup is needed.
 
 Note: The `.vscode/settings.json` references a `dance_env` interpreter path which doesn't exist — use `.venv` instead.
 
 ## Architecture
 
+Target hardware: Intel DK-2500 (Core Ultra 5 225U), Ubuntu 22.04, OpenVINO NPU, HDMI external display.
+
 Package layout under `src/dance_scoring/`:
 
-- **`core/`** — Scoring engine: `config.py` (constants), `frame.py` (PoseFrame dataclass), `extractor.py` (MediaPipe PoseLandmarker wrapper), `dtw.py` (DTW alignment), `scorer.py` (scoring pipeline), `segments.py` (segment extraction)
-- **`video/`** — Video tools: `info.py` (video metadata), `beat_detector.py` (audio/motion beat detection), `splitter.py` (8-beat segmentation), `merger.py` (clip merging)
-- **`camera/`** — Camera abstraction: `base.py`, `stream.py`, `usb.py`
-- **`gui/`** — Tkinter GUI: `app.py`, `components.py`, `worker.py`
-- **`hardware/`** — Hardware integration: `display.py`, `gpio.py`
-- **`transfer/`** — Data transfer: `base.py`, `bluetooth.py`, `wifi.py`
+| Layer | Directory | Modules | Status |
+|-------|-----------|---------|--------|
+| AI reasoning | `core/` | `config.py`, `frame.py`, `extractor.py`, `dtw.py`, `alignment.py`, `scorer.py`, `segments.py`, `inference.py`, `correction.py` | Active / Placeholder |
+| Data processing | `video/` | `info.py`, `beat_detector.py`, `splitter.py`, `merger.py` | Active |
+| Perception | `camera/` | `base.py`, `usb.py`, `stream.py` | Active |
+| Interaction | `gui/` | `app.py`, `components.py`, `worker.py` | Active |
+| Hardware (DK-2500) | `platform/` | `npu.py`, `gpio.py` | Placeholder |
+| Data transfer | `transfer/` | `base.py`, `wifi.py`, `bluetooth.py` | Placeholder |
+| ROS2 (optional) | `ros2/` | `nodes/`, `interfaces/`, `launch/` | Placeholder |
 
-**CLI entry points**: `scripts/score.py` (scoring), `scripts/split.py` (video segmentation)
+**CLI entry points**: `scripts/score.py` (offline scoring), `scripts/split.py` (video segmentation), `scripts/run_live.py` (camera practice, placeholder)
 
-**Key constants**: `BEATS_PER_SEGMENT=8`, `SLOW_SPEED=0.8`, `TARGET_FPS=30`, `PASS_SCORE=60.0`.
+**Key constants** (from commit `d3e03e9`): `BEATS_PER_SEGMENT=8`, `SLOW_SPEED=0.8`, `TARGET_FPS=30`, `PASS_SCORE=60.0`.
 
 **Input/Output conventions:**
-- Reference and user videos go in `assets/videos/`
+- Videos passed as CLI arguments (`-r`, `-u`), no fixed input directory
+- Model auto-downloaded to `~/.cache/dance_scoring/`
 - Segment clips output to `output/segments/`
 - Low-score practice clips output to `output/low_score_clips/`

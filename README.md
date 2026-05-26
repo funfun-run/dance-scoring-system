@@ -59,27 +59,27 @@ python check_env.py
 
 ```bash
 # 1. 将参考视频切分为 8 拍慢动作段
-python scripts/split.py -r assets/videos/reference.mp4
+python scripts/split.py -r <reference.mp4>
 
 # 2. 运行评分（需 BPM 与第1步一致，默认 120）
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4
+python scripts/score.py -r <reference.mp4> -u <user.mp4>
 
-# 3. 指定 BPM（需与 split_8beats 一致）
-python scripts/split.py -r assets/videos/reference.mp4 -b 100
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4 -b 100
+# 3. 指定 BPM
+python scripts/split.py -r <reference.mp4> -b 100
+python scripts/score.py -r <reference.mp4> -u <user.mp4> -b 100
 ```
 
 ### 自定义参数
 
 ```bash
 # 提高低分阈值（低于该分的段输出练习视频，默认 50）
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4 -t 60
+python scripts/score.py -r <reference.mp4> -u <user.mp4> -t 60
 
 # 自定义输出目录
-python scripts/split.py -r assets/videos/reference.mp4 -o my_segments
+python scripts/split.py -r <reference.mp4> -o my_segments
 
 # 指定 8 拍分段目录
-python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4 -s output/segments
+python scripts/score.py -r <reference.mp4> -u <user.mp4> -s output/segments
 ```
 
 ## 评分体系
@@ -117,22 +117,23 @@ python scripts/score.py -r assets/videos/reference.mp4 -u assets/videos/user.mp4
 
 ```
 ├── scripts/                    # CLI 入口
-│   ├── score.py                # 舞蹈评分
-│   └── split.py                # 视频分割
+│   ├── score.py                # 离线舞蹈评分
+│   ├── split.py                # 视频八拍分割
+│   └── run_live.py             # 摄像头实时跟练（预留）
 ├── src/dance_scoring/          # 核心包
-│   ├── core/                   #   评分引擎 (DTW, 评分, 分段)
-│   ├── video/                  #   视频处理 (分割, 节拍, 合并)
-│   ├── gui/                    #   Tkinter GUI
-│   ├── camera/                 #   摄像头抽象
-│   └── hardware/               #   硬件集成
+│   ├── core/                   #   AI推理层 (姿态估计, DTW/fastdtw, 评分, 分段, OpenVINO, 部位纠正)
+│   ├── video/                  #   数据处理层 (节拍检测, 切割, 合并)
+│   ├── camera/                 #   感知采集层 (USB摄像头, 帧缓冲)
+│   ├── gui/                    #   交互反馈层 (Tkinter, HDMI全屏)
+│   ├── platform/               #   DK-2500 硬件适配 (NPU, GPIO)
+│   ├── transfer/               #   数据交换 (WiFi, Bluetooth)
+│   └── ros2/                   #   ROS2 节点层 (预留)
 ├── tests/                      # 测试
-├── docs/                       # 文档
-├── assets/
-│   ├── model/                  # MediaPipe 模型 (自动下载)
-│   └── videos/                 # 输入视频
+├── docs/                       # 文档 & 规格
 ├── check_env.py                # 环境诊断工具
 ├── requirements.txt            # Python 依赖
-└── output/                     # 输出目录
+├── pyproject.toml              # 包安装配置
+└── output/                     # 运行时产出
     ├── segments/               # 8拍慢动作片段
     └── low_score_clips/        # 低分练习片段
 ```

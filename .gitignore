@@ -17,12 +17,8 @@ build/
 # Project output
 output/
 
-# User video files
-videos/
-assets/videos/
-
-# Model file (auto-downloaded)
-assets/model/pose_landmarker_lite.task
+# MediaPipe model (auto-downloaded to cache at runtime)
+pose_landmarker_lite.task
 
 # Claude Code
 .claude/
@@ -32,7 +28,6 @@ skills-lock.json
 # Process artifacts
 code_review.html
 audit_report.html
-AI开发路线纠正任务清单.md
 
 # Testing
 .pytest_cache/
