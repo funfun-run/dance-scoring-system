@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dance-scoring"
-version = "6.2.0"
+version = "1.0.0"
 description = "舞蹈评分系统 — MediaPipe pose landmark + DTW alignment"
 requires-python = ">=3.10"
 

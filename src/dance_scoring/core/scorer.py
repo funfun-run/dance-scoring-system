@@ -41,7 +41,7 @@ class Scorer:
             fs.append(self._nonlinear_score(ang_diff))
 
         if progress_callback: progress_callback(0, "分段评分...")
-        print("  [3/3] 八拍分段评分(与split_8beats统一)...")
+        print("  [3/3] 八拍分段评分...")
         segs = seg_by_beats(ref, path, fs, self.cfg.target_fps, self.bpm)
         overall = self._grade_overall(fs, segs)
         low = [s for s in segs if s['score'] < self.cfg.score_threshold]

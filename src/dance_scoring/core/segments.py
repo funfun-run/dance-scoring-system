@@ -10,7 +10,7 @@ from .config import PASS_SCORE, SLOW_SPEED, TARGET_FPS, BEATS_PER_SEGMENT
 
 def seg_by_beats(ref, path, fs, target_fps, bpm):
     """
-    按固定 BPM/节拍分段，段号与 split_8beats 输出文件一致。
+    按固定 BPM/节拍分段，段号与视频分割输出文件一致。
     """
     total_ref = len(ref)
     spb = 60.0 / bpm
@@ -59,7 +59,7 @@ def seg_by_beats(ref, path, fs, target_fps, bpm):
 def extract_clips_from_segments(segs, segments_dir="output/segments",
                                 out_dir="output/low_score_clips", cfg=None):
     """
-    从 split_8beats 生成的慢动作片段中复制低分段落。段号统一，直接按 id 匹配。
+    从视频分割工具生成的慢动作片段中复制低分段落。段号统一，直接按 id 匹配。
     """
     fail_segs = [s for s in segs if s['score'] < PASS_SCORE]
     if not fail_segs:

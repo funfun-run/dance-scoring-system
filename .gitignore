@@ -6,18 +6,23 @@ dance_env/
 
 # Python bytecode cache
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.so
+
+# Python build
+dist/
+build/
+*.egg-info/
 
 # Project output
 output/
-*.egg-info/
 
 # User video files
 videos/
+assets/videos/
 
 # Model file (auto-downloaded)
-pose_landmarker_lite.task
+assets/model/pose_landmarker_lite.task
 
 # Claude Code
 .claude/
@@ -29,6 +34,11 @@ code_review.html
 audit_report.html
 AI开发路线纠正任务清单.md
 
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # IDE
 .vscode/
 .idea/
@@ -36,3 +46,4 @@ AI开发路线纠正任务清单.md
 # OS
 .DS_Store
 Thumbs.db
+*.log

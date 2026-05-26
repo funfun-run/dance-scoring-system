@@ -2,7 +2,7 @@
 
 ## 一、项目背景
 
-当前舞蹈评分系统（`score_dance.py` v6.2 + `split_8beats.py` v2.3）为命令行工具，用户需通过终端输入命令完成视频分段、评分和结果查看。为提升易用性，需构建图形化界面（GUI），将核心流程（导入视频 → 预览 → 分段 → 评分 → 查看结果）整合为可视化操作。
+当前舞蹈评分系统（`scripts/score.py` v1.0 + `scripts/split.py` v1.0）为命令行工具，用户需通过终端输入命令完成视频分段、评分和结果查看。为提升易用性，需构建图形化界面（GUI），将核心流程（导入视频 → 预览 → 分段 → 评分 → 查看结果）整合为可视化操作。
 
 **基础代码**：`dance-scoring-system-main/dance-scoring-system-main/`
 
@@ -26,7 +26,7 @@
 
 ```
 ┌──────────────────────────────────────────────┐
-│  舞蹈评分系统 v6.2                            │
+│  舞蹈评分系统 v1.0                            │
 ├──────────────┬──────────────┬────────────────┤
 │  参考视频     │  用户视频     │  操作面板       │
 │  ┌─────────┐ │ ┌─────────┐ │                │
@@ -62,7 +62,7 @@
 - 文件无法被 OpenCV 打开 → 弹窗提示"不支持的文件格式"
 - 取消选择 → 保留原路径不变
 
-**复用代码**：`split_8beats.py:get_video_info()` — 已有视频信息提取函数
+**复用代码**：`scripts/split.py:get_video_info()` — 已有视频信息提取函数
 
 ### 3.3 视频预览播放 (P1)
 
@@ -83,7 +83,7 @@
 
 ### 3.4 视频分割与预览 (P0)
 
-**需求描述**：执行 `split_8beats.py` 逻辑，并在 GUI 中查看分割后的慢动作片段。
+**需求描述**：执行 `scripts/split.py` 逻辑，并在 GUI 中查看分割后的慢动作片段。
 
 **交互流程**：
 1. 用户配置 BPM（默认 120）
@@ -95,7 +95,7 @@
    - 支持逐段播放 / 停止
 5. 分割结果保存在 `output/segments/` 目录
 
-**复用代码**：直接调用 `split_8beats.py` 的函数：
+**复用代码**：直接调用 `scripts/split.py` 的函数：
 - `get_video_info()` — 视频信息
 - `detect_beats_from_audio()` — 音频节拍检测
 - `detect_beats_from_motion()` — 运动检测
@@ -135,7 +135,7 @@
 └──────────────────────────────────────────────┘
 ```
 
-**复用代码**：直接调用 `score_dance.py` 的核心类：
+**复用代码**：直接调用 `scripts/score.py` 的核心类：
 - `PoseExtractor` — 姿态提取（需进度回调）
 - `Scorer` — 评分引擎
 - `Scorer._seg_by_beats()` — 分段评分
@@ -190,15 +190,15 @@
 
 | 文件 | 改动点 | 说明 |
 |------|--------|------|
-| `score_dance.py` | `PoseExtractor.extract()` 增加 `progress_callback` 参数 | 支持 GUI 进度更新 |
-| `score_dance.py` | `Scorer.score()` 增加 `progress_callback` 参数 | DTW/评分阶段进度回调 |
+| `scripts/score.py` | `PoseExtractor.extract()` 增加 `progress_callback` 参数 | 支持 GUI 进度更新 |
+| `scripts/score.py` | `Scorer.score()` 增加 `progress_callback` 参数 | DTW/评分阶段进度回调 |
 | `requirements.txt` | 无需新增依赖 | Tkinter 为 Python 内置 |
 
 **改动原则**：对现有代码最小侵入。progress_callback 为可选参数（默认 None），CLI 模式不受影响。
 
 ### 5.3 不改动的文件
 
-- `split_8beats.py` — 通过模块导入直接调用，不改动
+- `scripts/split.py` — 通过模块导入直接调用，不改动
 - `check_env.py` — 保持不变
 
 ---

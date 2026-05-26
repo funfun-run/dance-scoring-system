@@ -25,7 +25,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("\n" + "=" * 60)
-    print("   🎬 8拍慢动作分段 v2.3")
+    print("   🎬 8拍慢动作分段 v1.0")
     print("=" * 60)
 
     fps, frames, duration, w, h = get_video_info(args.reference)

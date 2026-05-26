@@ -16,9 +16,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="舞蹈评分系统 CLI")
     parser.add_argument('-r', '--reference', default='assets/videos/reference.mp4')
     parser.add_argument('-u', '--user', default='assets/videos/user.mp4')
-    parser.add_argument('-b', '--bpm', type=int, default=DEFAULT_BPM, help='BPM（需与 split_8beats 一致）')
+    parser.add_argument('-b', '--bpm', type=int, default=DEFAULT_BPM, help='BPM（需与视频分割工具一致）')
     parser.add_argument('-t', '--threshold', type=float, default=50.0)
-    parser.add_argument('-s', '--segments', default='output/segments', help='split_8beats 输出目录')
+    parser.add_argument('-s', '--segments', default='output/segments', help='视频分段输出目录')
     args = parser.parse_args()
 
     for p, n in [(args.reference, "参考"), (args.user, "用户")]:
@@ -27,10 +27,10 @@ if __name__ == "__main__":
             sys.exit(1)
 
     print("\n" + "=" * 60)
-    print("   🕺 舞蹈评分 v6.2 | 统一分段逻辑")
+    print("   🕺 舞蹈评分 v1.0 | 统一分段逻辑")
     print("=" * 60)
     print(f"  BPM:{args.bpm} | 每段{BEATS_PER_SEGMENT}拍={60/args.bpm*BEATS_PER_SEGMENT:.1f}秒")
-    print(f"  分段与 split_8beats 完全一致，段号对应")
+    print(f"  分段与视频分割工具完全一致，段号对应")
     print(f"  合格线:{PASS_SCORE:.0f}分 | 阈值:{args.threshold}分")
 
     download_model()

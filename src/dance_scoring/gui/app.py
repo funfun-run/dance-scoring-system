@@ -16,7 +16,7 @@ VIDEO_FILTERS = [("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
 class MainApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("舞蹈评分系统 v6.2")
+        self.root.title("舞蹈评分系统 v1.0")
         self.root.geometry("960x640")
         self.root.minsize(860, 560)
 
@@ -43,7 +43,7 @@ class MainApp:
         main = tk.Frame(self.root, padx=8, pady=8)
         main.pack(fill=tk.BOTH, expand=True)
 
-        title = tk.Label(main, text="舞蹈评分系统 v6.2", font=("", 16, "bold"))
+        title = tk.Label(main, text="舞蹈评分系统 v1.0", font=("", 16, "bold"))
         title.pack(pady=(0, 8))
 
         body = tk.Frame(main)
