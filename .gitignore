@@ -1,5 +1,8 @@
 # Python virtual environment
 .venv/
+venv/
+env/
+dance_env/
 
 # Python bytecode cache
 __pycache__/
@@ -10,6 +13,26 @@ __pycache__/
 output/
 *.egg-info/
 
-# Claude internal
+# User video files
+videos/
+
+# Model file (auto-downloaded)
+pose_landmarker_lite.task
+
+# Claude Code
+.claude/
 .agents/
 skills-lock.json
+
+# Process artifacts
+code_review.html
+audit_report.html
+AI开发路线纠正任务清单.md
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

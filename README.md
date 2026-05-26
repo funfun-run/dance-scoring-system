@@ -116,16 +116,16 @@ python score_dance.py -r videos/reference.mp4 -u videos/user.mp4 -s output/segme
 ## 文件结构
 
 ```
-├── score_dance.py         # 主评分流水线 (v6.2)
-├── split_8beats.py        # 8拍慢动作分割工具 (v2.3)
-├── check_env.py           # 环境诊断工具
-├── requirements.txt       # Python 依赖
-├── pose_landmarker_lite.task  # MediaPipe 模型（自动下载）
-├── .vscode/               # VS Code 配置
-├── videos/                # 输入视频
+├── score_dance.py              # 主评分流水线 (v6.2)
+├── split_8beats.py             # 8拍慢动作分割工具 (v2.3)
+├── check_env.py                # 环境诊断工具
+├── requirements.txt            # Python 依赖
+├── pose_landmarker_lite.task   # MediaPipe 模型（自动下载）
+├── .vscode/                    # VS Code 配置
+├── videos/                     # 输入视频
 │   ├── reference.mp4
 │   └── user.mp4
-└── output/                # 输出目录
-    ├── segments/          # 8拍慢动作片段
-    └── low_score_clips/   # 低分练习片段
+└── output/                     # 输出目录
+    ├── segments/               # 8拍慢动作片段
+    └── low_score_clips/        # 低分练习片段
 ```
