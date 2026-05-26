@@ -1,0 +1,14 @@
+# Python virtual environment
+.venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Project output
+dance-scoring-system-main/dance-scoring-system-main/output/
+
+# Claude internal
+.agents/
+skills-lock.json

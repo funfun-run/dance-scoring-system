@@ -1,0 +1,13 @@
+# 核心依赖
+numpy>=1.24.0
+scipy>=1.10.0
+opencv-python>=4.8.0
+openvino>=2024.0.0
+mediapipe>=0.10.32
+
+# 音频分析（可选，librosa 为主力，madmom 为备选回退。madmom 在 Python 3.14 上编译可能失败，不影响核心功能）
+librosa>=0.10.0
+# madmom>=0.16.1           # Python 3.14 需先安装 Cython: pip install Cython && pip install --no-build-isolation madmom
+
+# GUI 依赖（Tkinter 为 Python 内置，无需安装）
+Pillow>=10.0.0

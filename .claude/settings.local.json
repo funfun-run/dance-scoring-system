@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone *)",
+      "Bash(git config *)",
+      "Bash(env)",
+      "Bash(ping -n 2 github.com)",
+      "Bash(GIT_CURL_VERBOSE=1 git clone -b main https://github.com/funfun-run/dance-scoring-system.git)",
+      "Bash(mkdir -p ~/.ssh)",
+      "Bash(ssh-keyscan github.com)",
+      "Bash(GIT_SSL_NO_VERIFY=1 git clone -b main https://github.com/funfun-run/dance-scoring-system.git)",
+      "Bash(unzip -o dance-scoring-system-main.zip -d dance-scoring-system-main)",
+      "Bash(mkdir -p temp_compare)",
+      "Bash(unzip -o dance-scoring-system-main.zip \"dance-scoring-system-main/check_env.py\" \"dance-scoring-system-main/score_dance.py\" \"dance-scoring-system-main/split_8beats.py\" \"dance-scoring-system-main/requirements.txt\" \"dance-scoring-system-main/README.md\" -d temp_compare)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/pip install *)",
+      "Bash(.venv/Scripts/python check_env.py)",
+      "Bash(.venv/Scripts/python score_dance.py --help)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(.venv/Scripts/python score_dance.py -r videos/reference.mp4 -u videos/user.mp4 -b 120)",
+      "Bash(.venv/Scripts/python gui_main.py)",
+      "Bash(C:/Users/Administrator.funfun-4060ti/Desktop/intel/dance-scoring-system-main/dance-scoring-system-main/.venv/Scripts/python.exe *)",
+      "Bash(C:/Users/Administrator.funfun-4060ti/Desktop/intel/.venv/Scripts/python.exe *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(npx skills *)",
+      "Bash(git ls-remote *)",
+      "Bash(curl -sI https://github.com)",
+      "Bash(ssh -o ConnectTimeout=10 -T git@github.com)",
+      "Read(//c/Users/Administrator.funfun-4060ti/.ssh/**)"
+    ]
+  }
+}
