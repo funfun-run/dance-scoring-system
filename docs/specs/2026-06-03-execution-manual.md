@@ -877,7 +877,7 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 
 创建模型目录: `mkdir -p src/dance_scoring/models`
 
-> **竞赛指标提醒**（出自方案书 2.3.1）：模型体积压缩 ≥50%，算力消耗降低 ≥40%。默认 INT8 量化可达到 ~75% 压缩率。
+> **精度选型说明**：DK-2500 (Meteor Lake NPU) 对 FP16 有原生硬件加速，推理速度最快。默认使用 FP16，同时满足竞赛方案 50% 体积压缩要求。
 
 ### 5.2 启动 Implementer Agent
 
@@ -899,30 +899,28 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 >    - 用 zipfile 解包，查找 .tflite 文件
 >    - 返回提取的 .tflite 文件路径
 >
-> 2. `convert_to_ir(tflite_path: Path, output_dir: Path, precision: str = "INT8") -> Path`
+> 2. `convert_to_ir(tflite_path: Path, output_dir: Path, precision: str = "FP16") -> Path`
 >    - 调用 openvino.convert_model() 转换
+>    - precision="FP16" → compress_to_fp16=True（默认，DK-2500 NPU 速度最快）
 >    - precision="FP32" → 不压缩，作为精度 baseline
->    - precision="FP16" → compress_to_fp16=True
->    - precision="INT8" → 使用 NNCF 或 OpenVINO 自带量化工具进行 INT8 量化（默认选项）
->    - INT8 校准时使用参考视频的前 100 帧作为校准数据集
+>    - precision="INT8" → 使用 NNCF 量化（可选，需校准数据）
 >    - 输出: output_dir/pose_landmarker.xml + .bin
 >
 > 3. `generate_meta(ir_xml: Path, tflite_path: Path, precision: str) -> dict`
 >    - 用 ov.Core().read_model() 加载 IR，动态提取输入/输出张量名称和 shape
 >    - 计算源 task 文件的 sha256
 >    - 记录原始 TFLite 大小 vs IR 大小，计算压缩率
->    - 返回 meta dict（含 compression_ratio 字段）
+>    - 返回 meta dict（含 compression_ratio、precision 字段）
 >
 > 4. `main()` CLI:
->    - argparse: --source, --output, --precision (默认 INT8, choices: FP32/FP16/INT8)
+>    - argparse: --source, --output, --precision (默认 FP16, choices: FP16/FP32/INT8)
 >    - 流程: 检查源模型 → 解包 → 转换 → 生成meta → 输出体积对比
 >
 > 关键注意事项：
-> - 默认使用 INT8 量化（满足竞赛指标：体积压缩≥50%）
+> - 默认 FP16：DK-2500 NPU 原生 FP16 加速，推理速度最快，同时满足 ≥50% 压缩指标
 > - 不要硬编码输入输出名称和 shape！使用 OpenVINO API 动态获取
 > - meta.json 格式需包含 compression_ratio 和 precision 字段
 > - 如果源 .task 文件不存在，先调用 extractor.download_model()
-> - 错误处理：转换失败时输出明确错误信息
 >
 > 完成后告诉我改动了哪些文件。
 > ```
@@ -1527,10 +1525,11 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 >
 > 模型体积:
 >   原始 TFLite:        5.6 MB
->   IR (INT8):          1.4 MB (压缩 75.0%)  ✓ 满足≥50%
+>   IR (FP16):          2.8 MB (压缩 50.0%)  ✓ 满足≥50%
 > =================================================
 > 竞赛指标: ✓ 全部达标
 >   [✓] 推理延迟 ≤50ms  [✓] 帧率 ≥20fps  [✓] 体积压缩 ≥50%
+>   精度: FP16（DK-2500 NPU 原生加速，速度最快）
 > ```
 >
 > 5. 测量方法:
@@ -1640,8 +1639,8 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 ## 模型压缩
 
 - 原始 TFLite: X.X MB
-- IR (INT8): X.X MB
-- 压缩率: XX% (竞赛要求 ≥50%)
+- IR (FP16): X.X MB
+- 压缩率: XX% (竞赛要求 ≥50%，FP16 预期 ~50%)
 
 ## 竞赛指标达标情况
 

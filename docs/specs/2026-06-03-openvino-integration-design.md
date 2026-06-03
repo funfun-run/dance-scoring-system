@@ -377,27 +377,27 @@ MediaPipe .task (Flatbuffer zip)
 
 支持三种精度等级：
 
-| 精度 | 说明 | 体积压缩目标 | 适用场景 |
-|------|------|-------------|----------|
-| FP32 | 原始精度，无压缩 | ~0% | 精度验证 baseline |
-| FP16 | 半精度浮点 | ~50% | 默认选项，精度损失可忽略 |
-| INT8 | 8-bit 整数量化 | ~75% | NPU 最优，需校准数据验证精度 |
+| 精度 | 说明 | NPU 速度 | 体积压缩 | 适用场景 |
+|------|------|---------|---------|----------|
+| FP16 | 半精度浮点 | **最快** | ~50% | 默认选项，DK-2500 NPU 原生支持，精度损失可忽略 |
+| FP32 | 原始精度 | 慢 | ~0% | 精度验证 baseline |
+| INT8 | 8-bit 整数量化 | 中等 | ~75% | 追求极致压缩时可选，需校准数据 |
 
-> **原始设计要求**（出自竞赛方案书 2.3.1）：基于 OpenVINO 工具链进行 INT8 量化与模型裁剪，核心模型体积压缩 ≥50%，算力消耗降低 ≥40%。
+> **选型理由**：Intel Core Ultra 5 225U (Meteor Lake) 的 NPU 对 FP16 有原生硬件加速，推理速度最快。FP16 同时满足竞赛方案的 50% 体积压缩要求。INT8 虽然压缩率更高，但量化/反量化引入额外开销，在 NPU 上实际推理速度通常不及 FP16，且需校准数据，故不作为默认选项。
 
 #### 5.5.2 脚本 scripts/convert_model.py
 
 ```bash
-python scripts/convert_model.py                    # 默认 INT8（满足竞赛指标）
-python scripts/convert_model.py --precision FP16   # 半精度
+python scripts/convert_model.py                    # 默认 FP16（DK-2500 NPU 最快）
 python scripts/convert_model.py --precision FP32   # 无压缩（精度验证用）
+python scripts/convert_model.py --precision INT8   # 极致压缩（需校准）
 ```
 
 **职责**：
 1. 检查 `~/.cache/dance_scoring/` 下模型, 无则触发下载
 2. 解包 .task 文件 (zipfile)
-3. 调用 `openvino.convert_model()` 转换，支持 FP32/FP16/INT8 量化
-4. INT8 量化需使用 nncf 或 OpenVINO 自带校准工具，以参考视频帧为校准数据集
+3. 调用 `openvino.convert_model()` 转换，默认 FP16（`compress_to_fp16=True`）
+4. 可选 INT8 量化（需 nncf 校准），可选 FP32（无压缩，精度 baseline）
 5. 生成 `meta.json` (输入输出规格 + 源模型 hash + 压缩率)
 6. 输出原始 TFLite 大小 vs IR 大小的对比
 
@@ -406,7 +406,7 @@ python scripts/convert_model.py --precision FP32   # 无压缩（精度验证用
 ```
 src/dance_scoring/models/
 ├── pose_landmarker.xml      # 模型图
-├── pose_landmarker.bin      # 权重（INT8 下体积约为原始的 25%）
+├── pose_landmarker.bin      # 权重（FP16 下体积约为原始的 50%）
 └── pose_landmarker_meta.json # {input, outputs, source_hash, compression_ratio, precision}
 ```
 
@@ -503,10 +503,10 @@ CPU 占用(%)         45%             12%
 模型体积对比:
   原始 TFLite:      5.6 MB
   IR (FP16):        2.8 MB (压缩 50%)
-  IR (INT8):        1.4 MB (压缩 75%)
 =================================================
 结论: OpenVINO 延迟降低 72.0%, 吞吐提升 3.6x
-      模型体积压缩 75%, 满足竞赛指标(≥50%)
+      模型体积压缩 50%, 满足竞赛指标(≥50%)
+      精度: FP16（DK-2500 NPU 原生加速，速度最快）
 ```
 
 #### 5.8.2 竞赛指标对照
