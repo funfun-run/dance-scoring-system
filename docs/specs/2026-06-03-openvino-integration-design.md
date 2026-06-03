@@ -13,6 +13,7 @@
 - `core/inference.py` — OpenVINO 推理引擎 (stub)
 - `core/correction.py` — 纠正提示生成 (stub)
 - `core/alignment.py` — 与 `dtw.py` 完全重复 (bug)
+- 节拍检测方案：原竞赛方案书采用 Madmom，实际实现采用 librosa（更轻量，无需额外系统依赖，功能等价）
 - `camera/usb.py` / `camera/stream.py` — 摄像头封装 (stub)
 - `scripts/run_live.py` — 实时跟练 (stub)
 - `platform/npu.py` — NPU 管理 (stub)
@@ -338,10 +339,14 @@ LivePanel 布局:
 │                    │  💪 薄弱部位:        │
 │                    │  🔴 右肘  🟡 左膝     │
 ├────────────────────┴─────────────────────┤
-│  [▶ 开始]  [⏸ 暂停]  [⏹ 停止]  [📁 选参考] │
+│ [▶开始] [⏸暂停] [⏹停止] [🔄循环] [📁选参考]│
+│ 倍速: [0.5x] [0.8x] [1.0x]              │
 └──────────────────────────────────────────┘
 ```
 
+功能说明：
+- **倍速调节**: 下拉或按钮组，控制练习片段播放速度（0.5x / 0.8x / 1.0x），对应 segments.py 的慢动作逻辑
+- **循环练习**: 开关按钮，开启后当前段练习结束后自动重新开始，方便反复练习薄弱段
 - `PoseOverlay`: 在视频帧上绘制 33 关节点 + 骨骼连线，偏离关节红色高亮，正常关节绿色
 - 数据流: `LiveScorer(worker线程)` → 回调 → `LivePanel._on_update(data)`
 - GUI 完全不感知底层推理后端
@@ -363,32 +368,46 @@ LivePanel 布局:
 ```
 MediaPipe .task (Flatbuffer zip)
     ↓ 解包
-  pose_landmarker.tflite
-    ↓ ovc 转换
+  pose_landmarker.tflite (原始大小)
+    ↓ ovc 转换 + 量化
   pose_landmarker.xml + pose_landmarker.bin (OpenVINO IR)
+    ↓ 体积对比
+  记录压缩率 → meta.json
 ```
+
+支持三种精度等级：
+
+| 精度 | 说明 | 体积压缩目标 | 适用场景 |
+|------|------|-------------|----------|
+| FP32 | 原始精度，无压缩 | ~0% | 精度验证 baseline |
+| FP16 | 半精度浮点 | ~50% | 默认选项，精度损失可忽略 |
+| INT8 | 8-bit 整数量化 | ~75% | NPU 最优，需校准数据验证精度 |
+
+> **原始设计要求**（出自竞赛方案书 2.3.1）：基于 OpenVINO 工具链进行 INT8 量化与模型裁剪，核心模型体积压缩 ≥50%，算力消耗降低 ≥40%。
 
 #### 5.5.2 脚本 scripts/convert_model.py
 
 ```bash
-python scripts/convert_model.py                  # 默认 FP16
-python scripts/convert_model.py --precision FP32  # 可选
+python scripts/convert_model.py                    # 默认 INT8（满足竞赛指标）
+python scripts/convert_model.py --precision FP16   # 半精度
+python scripts/convert_model.py --precision FP32   # 无压缩（精度验证用）
 ```
 
 **职责**：
 1. 检查 `~/.cache/dance_scoring/` 下模型, 无则触发下载
 2. 解包 .task 文件 (zipfile)
-3. 调用 `openvino.convert_model()` 转换
-4. 生成 `meta.json` (输入输出规格 + 源模型 hash)
-5. 基准测试验证 (对比 MediaPipe vs IR 推理一致性)
+3. 调用 `openvino.convert_model()` 转换，支持 FP32/FP16/INT8 量化
+4. INT8 量化需使用 nncf 或 OpenVINO 自带校准工具，以参考视频帧为校准数据集
+5. 生成 `meta.json` (输入输出规格 + 源模型 hash + 压缩率)
+6. 输出原始 TFLite 大小 vs IR 大小的对比
 
 #### 5.5.3 产物
 
 ```
 src/dance_scoring/models/
 ├── pose_landmarker.xml      # 模型图
-├── pose_landmarker.bin      # 权重
-└── pose_landmarker_meta.json # {input, outputs, source_hash}
+├── pose_landmarker.bin      # 权重（INT8 下体积约为原始的 25%）
+└── pose_landmarker_meta.json # {input, outputs, source_hash, compression_ratio, precision}
 ```
 
 ---
@@ -466,16 +485,44 @@ def create_pose_engine(backend: str = "auto", cfg: Config = Config()) -> PoseEng
 
 ```
 输出:
-指标              MediaPipe       OpenVINO(NPU)
+=================================================
+  姿态推理性能对比
+=================================================
+测试视频: reference.mp4
+测试帧数: 100
+设备: Intel Core Ultra 5 225U
+
+指标              MediaPipe(CPU)    OpenVINO(NPU)
 ──────────────────────────────────────────────
 平均推理(ms)        18.2            5.1
 P99 延迟(ms)        22.4            6.8
 首帧延迟(ms)        45.1            12.3
 帧处理吞吐(fps)     54.9            196.0
 CPU 占用(%)         45%             12%
+
+模型体积对比:
+  原始 TFLite:      5.6 MB
+  IR (FP16):        2.8 MB (压缩 50%)
+  IR (INT8):        1.4 MB (压缩 75%)
+=================================================
+结论: OpenVINO 延迟降低 72.0%, 吞吐提升 3.6x
+      模型体积压缩 75%, 满足竞赛指标(≥50%)
 ```
 
-#### 5.8.2 正确性验证
+#### 5.8.2 竞赛指标对照
+
+| 指标 | 竞赛要求 | 目标值 |
+|------|---------|--------|
+| 单帧推理延迟 | ≤50ms | <33ms (更严格) |
+| 实时帧率 | ≥20fps | 30fps (更严格) |
+| 八拍分段精度 | ≥95% | ≥95% |
+| 节拍检测误差 | ≤100ms | ≤100ms |
+| 模型体积压缩 | ≥50% | ≥50% (INT8 可达 75%) |
+| 算力消耗降低 | ≥40% | ≥40% |
+| 评分一致性 | ≥85% | ≥85% |
+| 薄弱环节定位 | ≥90% | ≥90% |
+
+#### 5.8.3 正确性验证
 
 两个后端提取同一视频，逐帧对比关键点坐标误差。期望平均误差 < 1mm。
 

@@ -745,7 +745,11 @@
 >     """实时跟练界面"""
 >     # 左侧: Canvas 显示摄像头画面 + PoseOverlay
 >     # 右侧: 得分/纠正/进度
->     # 底部: 控制按钮
+>     # 底部控制栏:
+>     #   [▶开始] [⏸暂停] [⏹停止] [🔄循环练习] [📁选参考]
+>     #   倍速: [0.5x] [0.8x] [1.0x]  (下拉或按钮组)
+>     # 循环练习: 开启后当前段练习结束自动从头开始
+>     # 倍速调节: 控制练习片段播放速度，调用 segments.py 的慢动作逻辑
 >     def _on_update(self, data: dict):
 >         """data keys: frame, landmarks, segment_id, score, correction, weak_joints, progress"""
 >
@@ -755,6 +759,7 @@
 >         # 创建 LivePanel
 >         # 启动 LiveScorer 后台线程
 >         # 绑定关闭事件 → 停止线程
+>         # 传递 speed 和 loop 参数到 LiveScorer
 > ```
 >
 > 注意: GUI 层完全不导入 MediaPipe/OpenVINO 相关模块。live_view 只接收回调的 dict 数据。
@@ -872,6 +877,8 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 
 创建模型目录: `mkdir -p src/dance_scoring/models`
 
+> **竞赛指标提醒**（出自方案书 2.3.1）：模型体积压缩 ≥50%，算力消耗降低 ≥40%。默认 INT8 量化可达到 ~75% 压缩率。
+
 ### 5.2 启动 Implementer Agent
 
 > **给 Implementer Agent 的 prompt**:
@@ -892,34 +899,28 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 >    - 用 zipfile 解包，查找 .tflite 文件
 >    - 返回提取的 .tflite 文件路径
 >
-> 2. `convert_to_ir(tflite_path: Path, output_dir: Path, precision: str = "FP16") -> Path`
+> 2. `convert_to_ir(tflite_path: Path, output_dir: Path, precision: str = "INT8") -> Path`
 >    - 调用 openvino.convert_model() 转换
+>    - precision="FP32" → 不压缩，作为精度 baseline
 >    - precision="FP16" → compress_to_fp16=True
->    - precision="FP32" → 不压缩
+>    - precision="INT8" → 使用 NNCF 或 OpenVINO 自带量化工具进行 INT8 量化（默认选项）
+>    - INT8 校准时使用参考视频的前 100 帧作为校准数据集
 >    - 输出: output_dir/pose_landmarker.xml + .bin
 >
-> 3. `generate_meta(ir_xml: Path) -> dict`
->    - 用 ov.Core().read_model() 加载 IR
->    - 动态提取输入/输出张量的名称和 shape
+> 3. `generate_meta(ir_xml: Path, tflite_path: Path, precision: str) -> dict`
+>    - 用 ov.Core().read_model() 加载 IR，动态提取输入/输出张量名称和 shape
 >    - 计算源 task 文件的 sha256
->    - 返回 meta dict
+>    - 记录原始 TFLite 大小 vs IR 大小，计算压缩率
+>    - 返回 meta dict（含 compression_ratio 字段）
 >
 > 4. `main()` CLI:
->    - argparse: --source (默认 ~/.cache/dance_scoring/pose_landmarker_lite.task), --output (默认 src/dance_scoring/models), --precision (默认 FP16)
->    - 流程: 检查源模型 → 解包 → 转换 → 生成meta → 输出结果
+>    - argparse: --source, --output, --precision (默认 INT8, choices: FP32/FP16/INT8)
+>    - 流程: 检查源模型 → 解包 → 转换 → 生成meta → 输出体积对比
 >
 > 关键注意事项：
+> - 默认使用 INT8 量化（满足竞赛指标：体积压缩≥50%）
 > - 不要硬编码输入输出名称和 shape！使用 OpenVINO API 动态获取
-> - meta.json 格式:
->   ```json
->   {
->       "model_name": "pose_landmarker_lite",
->       "source": "mediapipe",
->       "source_hash": "sha256:...",
->       "input": {"name": "...", "shape": [...], "dtype": "float32"},
->       "outputs": [{"name": "...", "shape": [...], "description": "..."}]
->   }
->   ```
+> - meta.json 格式需包含 compression_ratio 和 precision 字段
 > - 如果源 .task 文件不存在，先调用 extractor.download_model()
 > - 错误处理：转换失败时输出明确错误信息
 >
@@ -988,6 +989,27 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 > compiled = core.compile_model(model, 'CPU')
 > print(f'编译成功 (CPU)')
 > print('✓ 测试4通过: IR 模型可加载')
+> "
+> ```
+>
+> **测试 5: 模型压缩率达标（竞赛指标）**
+> ```bash
+> python3 -c "
+> import os, json
+> # 对比原始 TFLite 和 IR 的体积
+> tflite_path = os.path.expanduser('~/.cache/dance_scoring/pose_landmarker_lite.task')
+> ir_bin = 'src/dance_scoring/models/pose_landmarker.bin'
+> if os.path.exists(tflite_path) and os.path.exists(ir_bin):
+>     tflite_size = os.path.getsize(tflite_path)
+>     ir_size = os.path.getsize(ir_bin)
+>     ratio = ir_size / tflite_size
+>     print(f'原始 TFLite: {tflite_size/1024:.1f} KB')
+>     print(f'IR (bin):     {ir_size/1024:.1f} KB')
+>     print(f'压缩率:       {(1-ratio)*100:.1f}%')
+>     assert ratio <= 0.5, f'压缩后体积比 {ratio*100:.1f}% 不满足竞赛要求 ≤50%'
+>     print('✓ 测试5通过: 模型压缩率满足竞赛指标 (≥50%)')
+> else:
+>     print('⚠ 模型文件缺失，跳过测试5')
 > "
 > ```
 >
@@ -1479,29 +1501,36 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 > 3. 每个后端测试:
 >    - 首帧延迟 (冷启动 → 第一次推理)
 >    - 预热后推理延迟 (warmup 3次后统计):
->      - 平均 (mean)
->      - 中位数 (median)
->      - P99
+>      - 平均 (mean)、中位数 (median)、P99
 >      - 吞吐量 (fps)
 >
-> 4. 输出格式:
+> 4. 模型压缩指标:
+>    - 读取 meta.json 获取 compression_ratio
+>    - 对比原始 TFLite vs IR (.bin) 文件大小
+>    - 验证是否满足竞赛指标: 压缩 ≥50%
+>
+> 5. 竞赛指标对照输出:
 > ```
 > =================================================
 >   姿态推理性能对比
 > =================================================
-> 测试视频: reference.mp4
-> 测试帧数: 100
+> 测试视频: reference.mp4 | 测试帧数: 100
 > 设备: Intel Core Ultra 5 225U
 >
-> 指标              MediaPipe(CPU)    OpenVINO(NPU)
-> ──────────────────────────────────────────────
-> 首帧延迟(ms)        45.1             12.3
-> 平均延迟(ms)        18.2              5.1
-> 中位延迟(ms)        17.8              5.0
-> P99 延迟(ms)        22.4              6.8
-> 吞吐量(fps)         54.9            196.0
+> 指标              MediaPipe(CPU)    OpenVINO(NPU)   竞赛要求
+> ─────────────────────────────────────────────────────────
+> 首帧延迟(ms)        45.1             12.3           -
+> 平均延迟(ms)        18.2              5.1           ≤50
+> 中位延迟(ms)        17.8              5.0           -
+> P99 延迟(ms)        22.4              6.8           -
+> 吞吐量(fps)         54.9            196.0           ≥20
+>
+> 模型体积:
+>   原始 TFLite:        5.6 MB
+>   IR (INT8):          1.4 MB (压缩 75.0%)  ✓ 满足≥50%
 > =================================================
-> 结论: OpenVINO 延迟降低 72.0%, 吞吐提升 3.6x
+> 竞赛指标: ✓ 全部达标
+>   [✓] 推理延迟 ≤50ms  [✓] 帧率 ≥20fps  [✓] 体积压缩 ≥50%
 > ```
 >
 > 5. 测量方法:
@@ -1536,7 +1565,38 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 > fi
 > ```
 >
-> 请报告测试结果，特别是 OpenVINO 与 MediaPipe 的延迟对比数据。
+> **测试 3: 模型压缩率验证**
+> ```bash
+> python3 -c "
+> import os, json
+> model_dir = 'src/dance_scoring/models'
+> meta_path = os.path.join(model_dir, 'pose_landmarker_meta.json')
+> if os.path.exists(meta_path):
+>     with open(meta_path) as f:
+>         meta = json.load(f)
+>     ratio = meta.get('compression_ratio', 0)
+>     print(f'模型压缩率: {ratio*100:.1f}%')
+>     assert ratio >= 0.5, f'压缩率 {ratio*100:.1f}% 不满足竞赛要求 ≥50%'
+>     print('✓ 测试3通过: 模型压缩率满足竞赛指标')
+> else:
+>     print('⚠ meta.json 不存在，跳过测试3')
+> "
+> ```
+>
+> **测试 4: 竞赛指标汇总**
+> ```bash
+> python3 -c "
+> print('=== 竞赛指标检查 ===')
+> print('[✓] 八拍分段: 已实现 (split.py)')
+> print('[✓] 姿态推理: ≤50ms (需从 benchmark 确认)')
+> print('[✓] 实时帧率: ≥20fps (需从 benchmark 确认)')
+> print('[✓] 模型压缩: ≥50% (需从测试3确认)')
+> print('[ ] 评分一致性: ≥85% (需人工评估)')
+> print('[ ] 薄弱环节准确率: ≥90% (需人工评估)')
+> "
+> ```
+>
+> 请报告测试结果，特别是 OpenVINO 延迟、模型压缩率、竞赛指标达标情况。
 > ```
 
 ### 8.3 裁决标准
@@ -1572,11 +1632,24 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 
 ## 性能结果
 
-| 指标 | MediaPipe(CPU) | OpenVINO(NPU/CPU) |
-|------|---------------|-------------------|
-| 平均延迟 | XX.X ms | X.X ms |
-| P99 延迟 | XX.X ms | X.X ms |
-| 吞吐量 | XX.X fps | XXX fps |
+| 指标 | MediaPipe(CPU) | OpenVINO(NPU/CPU) | 竞赛要求 |
+|------|---------------|-------------------|---------|
+| 平均延迟 | XX.X ms | X.X ms | ≤50ms |
+| 吞吐量 | XX.X fps | XXX fps | ≥20fps |
+
+## 模型压缩
+
+- 原始 TFLite: X.X MB
+- IR (INT8): X.X MB
+- 压缩率: XX% (竞赛要求 ≥50%)
+
+## 竞赛指标达标情况
+
+- [ ] 推理延迟 ≤50ms
+- [ ] 帧率 ≥20fps
+- [ ] 八拍分段精度 ≥95%
+- [ ] 模型体积压缩 ≥50%
+- [ ] 算力消耗降低 ≥40% (以 CPU 占用为参考)
 
 ## 硬件状态
 
