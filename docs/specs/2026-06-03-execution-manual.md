@@ -23,6 +23,10 @@
 
 **你绝对不要自己修改代码**——代码变更全部交给 Implementer Agent。
 
+**核心禁令**：
+- **禁止修改 `scorer.py` 的评分算法**。`Scorer._nonlinear_score()` 的容差参数（3°/15°）、扣分系数（1.8/3.0）、`_grade_overall()` 的 5 档判定逻辑、段合格线（60 分）、关节角度权重（`ANGLE_WEIGHTS`）均为已确定的竞赛评分标准，不得改动。唯一允许的变更是增加 `alignment_method` 参数（用于选择 DTW/fastdtw 对齐方式，不影响评分计算本身）。
+- **禁止修改 `frame.py` 的特征向量结构**。`PoseFrame.vec` 的拼接方式（66 维坐标 + 26 维角度 = 92 维）是下游对齐算法的输入格式，改动会导致评分不可比。
+
 ### 0.2 Implementer Agent（子 Agent）
 
 - 接收你的实现指令
