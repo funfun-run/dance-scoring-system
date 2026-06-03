@@ -538,7 +538,7 @@
 >
 > 关键设计要点：
 > - 实时模式下，PoseExtractor 单帧提取：遍历视频帧时提取逻辑与现有 extract() 方法一致，但改为一帧一帧处理
-> - 对齐策略：用户窗口 vs 参考当前段，用 fastdtw，recturn path 只取窗口后半段结果避免边界效应
+> - 对齐策略：用户窗口 vs 参考当前段，用 fastdtw，return path 只取窗口后半段结果避免边界效应
 > - 错误处理：摄像头断开/无帧时给出明确提示而不崩溃
 > - 输出格式见下方示例
 >
@@ -993,17 +993,20 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 > **测试 5: 模型压缩率达标（竞赛指标）**
 > ```bash
 > python3 -c "
-> import os, json
-> # 对比原始 TFLite 和 IR 的体积
-> tflite_path = os.path.expanduser('~/.cache/dance_scoring/pose_landmarker_lite.task')
+> import os, json, zipfile, tempfile
+> # 从 .task 中提取 .tflite，精确对比模型体积
+> task_path = os.path.expanduser('~/.cache/dance_scoring/pose_landmarker_lite.task')
 > ir_bin = 'src/dance_scoring/models/pose_landmarker.bin'
-> if os.path.exists(tflite_path) and os.path.exists(ir_bin):
->     tflite_size = os.path.getsize(tflite_path)
+> if os.path.exists(task_path) and os.path.exists(ir_bin):
+>     # 提取 .tflite 并获取大小
+>     with zipfile.ZipFile(task_path, 'r') as zf:
+>         tflite_name = [n for n in zf.namelist() if n.endswith('.tflite')][0]
+>         tflite_size = zf.getinfo(tflite_name).file_size
 >     ir_size = os.path.getsize(ir_bin)
 >     ratio = ir_size / tflite_size
 >     print(f'原始 TFLite: {tflite_size/1024:.1f} KB')
->     print(f'IR (bin):     {ir_size/1024:.1f} KB')
->     print(f'压缩率:       {(1-ratio)*100:.1f}%')
+>     print(f'IR (FP16):   {ir_size/1024:.1f} KB')
+>     print(f'压缩率:      {(1-ratio)*100:.1f}%')
 >     assert ratio <= 0.5, f'压缩后体积比 {ratio*100:.1f}% 不满足竞赛要求 ≤50%'
 >     print('✓ 测试5通过: 模型压缩率满足竞赛指标 (≥50%)')
 > else:
@@ -1018,7 +1021,7 @@ python3 -c "import openvino; print(f'OpenVINO {openvino.__version__}')"
 
 | Tester 结果 | 你的操作 |
 |-------------|----------|
-| 全部 4 项通过 | `git add -A && git commit -m "feat: Phase 2a - OpenVINO 模型转换流水线"` → 进入 Phase 2b |
+| 全部 5 项通过 | `git add -A && git commit -m "feat: Phase 2a - OpenVINO 模型转换流水线"` → 进入 Phase 2b |
 | 有失败 | 发给 Implementer 修复 → 重新 Tester |
 
 ---
