@@ -4,12 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-Dance scoring system v2.0 — 基于嵌入式边缘计算的舞蹈分段跟练与姿态纠错系统. Target hardware: Intel DK-2500 (Core Ultra 5 225U + NPU), deployment OS: Ubuntu 22.04 + OpenVINO. Compares a user's dance video against a reference video using MediaPipe pose landmark detection, joint-angle analysis, DTW alignment, fastdtw, and segment-based scoring. Outputs a terminal score report, generates slow-motion practice clips, and pinpoints weak body parts for corrective feedback.
+Dance scoring system v2.0 — 基于嵌入式边缘计算的舞蹈分段跟练与姿态纠错系统. Target hardware: Intel DK-2500 (Core Ultra 5 225U + NPU), deployment OS: Ubuntu 22.04 + OpenVINO. Compares a user's dance video against a reference video using MediaPipe pose landmark detection, joint-angle analysis, DTW/fastdtw alignment, and segment-based scoring. Outputs a terminal score report, generates slow-motion practice clips, and pinpoints weak body parts for corrective feedback.
+
+> **设计文档**: `docs/specs/2026-06-03-openvino-integration-design.md` — OpenVINO 加速集成完整方案
+> **执行手册**: `docs/specs/2026-06-03-execution-manual.md` — DK-2500 多 Agent 协作执行剧本
 
 ## Commands
 
 ```bash
-# Offline scoring
+# Offline scoring (default: DTW alignment)
 python scripts/score.py -r <reference.mp4> -u <user.mp4>
 
 # Custom score threshold (default 50)
@@ -24,8 +27,14 @@ python scripts/split.py -r <reference.mp4> -b 100
 # Launch GUI
 python src/dance_scoring/gui/app.py
 
-# Live camera practice (placeholder)
-python scripts/run_live.py
+# Live camera practice (placeholder — see execution manual)
+python scripts/run_live.py -r <reference.mp4>
+
+# OpenVINO model conversion (after Phase 2a)
+python scripts/convert_model.py
+
+# Performance benchmark (after Phase 2d)
+python scripts/benchmark.py <video_path>
 ```
 
 ## Dependencies
@@ -40,6 +49,14 @@ The MediaPipe pose landmarker model is auto-downloaded on first run (~5.6 MB) to
 
 Note: The `.vscode/settings.json` references a `dance_env` interpreter path which doesn't exist — use `.venv` instead.
 
+### Pending additions (to be installed during Phase execution)
+
+| Package | Phase | Purpose |
+|---------|-------|---------|
+| `fastdtw==0.3.4` | 1a | Fast DTW alignment for real-time mode |
+| `ttkbootstrap>=1.10.0` | 1d | Modern dark-themed GUI |
+| `openvino>=2024.0` | 2a | NPU-accelerated inference |
+
 ## Architecture
 
 Target hardware: Intel DK-2500 (Core Ultra 5 225U), Ubuntu 22.04, OpenVINO NPU, HDMI external display.
@@ -48,20 +65,41 @@ Package layout under `src/dance_scoring/`:
 
 | Layer | Directory | Modules | Status |
 |-------|-----------|---------|--------|
-| AI reasoning | `core/` | `config.py`, `frame.py`, `extractor.py`, `dtw.py`, `alignment.py`, `scorer.py`, `segments.py`, `inference.py`, `correction.py` | Active / Placeholder |
+| AI reasoning | `core/` | `config.py`, `frame.py`, `extractor.py`, `dtw.py`, `alignment.py`, `scorer.py`, `segments.py`, `inference.py`, `correction.py`, `engine.py` | Partial — alignment (duplicate bug), inference/correction/engine (stub) |
 | Data processing | `video/` | `info.py`, `beat_detector.py`, `splitter.py`, `merger.py` | Active |
-| Perception | `camera/` | `base.py`, `usb.py`, `stream.py` | Active |
-| Interaction | `gui/` | `app.py`, `components.py`, `worker.py` | Active |
+| Perception | `camera/` | `base.py`, `usb.py`, `stream.py` | Stub |
+| Interaction | `gui/` | `app.py`, `components.py`, `worker.py`, `theme.py`, `live_view.py` | Active — missing theme/live_view |
 | Hardware (DK-2500) | `platform/` | `npu.py`, `gpio.py` | Placeholder |
 | Data transfer | `transfer/` | `base.py`, `wifi.py`, `bluetooth.py` | Placeholder |
 | ROS2 (optional) | `ros2/` | `nodes/`, `interfaces/`, `launch/` | Placeholder |
 
-**CLI entry points**: `scripts/score.py` (offline scoring), `scripts/split.py` (video segmentation), `scripts/run_live.py` (camera practice, placeholder)
+**CLI entry points**: `scripts/score.py` (offline scoring), `scripts/split.py` (video segmentation), `scripts/run_live.py` (live practice, stub), `scripts/convert_model.py` (model conversion, to be created), `scripts/benchmark.py` (perf test, to be created).
 
-**Key constants** (from commit `d3e03e9`): `BEATS_PER_SEGMENT=8`, `SLOW_SPEED=0.8`, `TARGET_FPS=30`, `PASS_SCORE=60.0`.
+**Key constants**: `BEATS_PER_SEGMENT=8`, `SLOW_SPEED=0.8`, `TARGET_FPS=30`, `PASS_SCORE=60.0`.
+
+**Key design decisions**:
+- Beat detection uses **librosa** (not Madmom as in original proposal — lighter weight, no extra system deps)
+- OpenVINO default precision is **FP16** (fastest on Meteor Lake NPU, meets 50% compression target)
+- Offline scoring uses **standard DTW** for accuracy; real-time mode uses **fastdtw** for speed
 
 **Input/Output conventions:**
 - Videos passed as CLI arguments (`-r`, `-u`), no fixed input directory
 - Model auto-downloaded to `~/.cache/dance_scoring/`
 - Segment clips output to `output/segments/`
 - Low-score practice clips output to `output/low_score_clips/`
+- IR model output to `src/dance_scoring/models/` (gitignored, generated by `convert_model.py`)
+
+## Competition targets
+
+From the original proposal (设计文档.doc 2.5.1):
+
+| Metric | Target |
+|--------|--------|
+| 8-beat segmentation accuracy | ≥95% |
+| Beat detection error | ≤100ms |
+| Single-frame inference latency | ≤50ms |
+| Real-time frame rate | ≥20fps |
+| Model volume compression | ≥50% |
+| Compute reduction | ≥40% |
+| Scoring vs human consistency | ≥85% |
+| Weak-point localization accuracy | ≥90% |
