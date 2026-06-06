@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dance-scoring"
+version = "1.0.0"
+description = "舞蹈评分系统 — MediaPipe pose landmark + DTW alignment"
+requires-python = ">=3.10"
+
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "mediapipe>=0.10.0",
+    "Pillow>=9.0",
+    "librosa>=0.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

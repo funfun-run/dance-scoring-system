@@ -1,5 +1,7 @@
 # 忽略虚拟环境
 .venv/
+ov_env/
+dance_env/
 pyvenv.cfg
 
 # 忽略python缓存
@@ -7,5 +9,10 @@ __pycache__/
 *.pyc
 *.pyd
 
-# 输出视频文件夹（可选）
+# 输出视频文件夹
+output/
 OUTPUT_*/
+temp_*.wav
+temp_*.mp4
+temp_list.txt
+temp_scaled_*.mp4
