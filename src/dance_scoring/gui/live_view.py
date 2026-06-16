@@ -363,6 +363,8 @@ class LiveWorker(threading.Thread):
         self.queue.put(summary)
         print(f"[跟练] 本轮完成: 均分{avg_score:.1f}, {qualified}/{total}合格, "
               f"薄弱部位: {[w[2] for w in weakest[:3]]}")
+
+    def _score_window(self, scorer):
         from dance_scoring.core.config import ANGLE_JOINTS
         if not self.ref_segs:
             return None
