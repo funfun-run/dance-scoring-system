@@ -72,14 +72,20 @@ class LiveWorker(threading.Thread):
         self.bpm = bpm
         self.alignment = alignment
         self._cancel = threading.Event()
+        self._paused = threading.Event()  # 轮次完成后暂停，等待 GUI 点击继续
 
     def cancel(self):
         self._cancel.set()
+        self._paused.set()  # 取消时也要解除暂停，防止永久阻塞
         try:
             if hasattr(self, 'camera') and self.camera:
                 self.camera.close()
         except Exception:
             pass
+
+    def resume(self):
+        """GUI 调用，解除暂停继续下一轮练习。"""
+        self._paused.set()
 
     def run(self):
         try:
@@ -151,13 +157,6 @@ class LiveWorker(threading.Thread):
                 'raw_start': rs, 'raw_end': re,
             })
 
-        print(f"[DEBUG] _setup: nref={nref}, raw_total={raw_total}, ratio={ratio:.3f}, "
-              f"fps={fps}, num_segs={len(self.ref_segs)}")
-        for s in self.ref_segs:
-            print(f"  段{s['id']}: pose[{s['start']}:{s['end']}] "
-                  f"raw[{s['raw_start']}:{s['raw_end']}] "
-                  f"(raw={s['raw_end']-s['raw_start']}, pose={s['end']-s['start']})")
-
         # 从内存切片加载第一段帧
         self._ref_raw_cache = []
         self._ref_raw_seg_id = 0
@@ -223,13 +222,15 @@ class LiveWorker(threading.Thread):
                         self.queue.put(data)
 
                         if self.current_seg >= len(self.ref_segs):
-                            self.queue.put({
-                                'type': 'summary',
-                                'seg_results': list(self.seg_results),
-                            })
-                            print(f"[跟练] 全部 {len(self.ref_segs)} 段完成，重新开始")
+                            self._send_cycle_complete()
+                            # 等待 GUI 点击继续
+                            self._paused.wait(timeout=300)  # 最多等5分钟
+                            if self._cancel.is_set():
+                                break
+                            self._paused.clear()
                             self.current_seg = 0
                             self.seg_results = []
+                            print(f"[跟练] 全部 {len(self.ref_segs)} 段完成，开始新一轮")
                         self._send_segment_start()
                     self.window = self.window[self.window_step:]
 
@@ -281,10 +282,6 @@ class LiveWorker(threading.Thread):
         re = max(rs + 1, min(re, len(all_frames)))
         self._ref_raw_cache = all_frames[rs:re]
         self._ref_raw_seg_id = seg_idx
-        print(f"[DEBUG] _load_seg_raw_frames: seg_idx={seg_idx}, "
-              f"seg_id={seg['id']}, raw_start={seg['raw_start']}->{rs}, "
-              f"raw_end={seg['raw_end']}->{re}, cache_size={len(self._ref_raw_cache)}, "
-              f"all_frames_total={len(all_frames)}")
 
     def _get_current_ref_frame(self):
         """获取当前段当前应显示的参考视频帧 (循环播放)。"""
@@ -294,36 +291,78 @@ class LiveWorker(threading.Thread):
         # 切换段时重新加载
         if idx != self._ref_raw_seg_id:
             self._load_seg_raw_frames(idx)
-            print(f"[DEBUG] _get_current_ref_frame: 加载新段 idx={idx}, "
-                  f"cache_size={len(self._ref_raw_cache)}")
         if not self._ref_raw_cache:
             return None
         pos = self._seg_frame_no % max(len(self._ref_raw_cache), 1)
-        if pos == 0 or self._seg_frame_no == 0:
-            print(f"[DEBUG] _get_current_ref_frame: idx={idx}, "
-                  f"_seg_frame_no={self._seg_frame_no}, pos={pos}, "
-                  f"cache_size={len(self._ref_raw_cache)}, "
-                  f"rs={self.ref_segs[idx]['raw_start']}, "
-                  f"re={self.ref_segs[idx]['raw_end']}")
         return self._ref_raw_cache[pos]
 
     def _send_segment_start(self):
         if not self.ref_segs:
             return
-        old_fno = self._seg_frame_no
         self._seg_frame_no = 0
         idx = min(self.current_seg, len(self.ref_segs) - 1)
         seg = self.ref_segs[idx]
-        print(f"[DEBUG] _send_segment_start: current_seg={self.current_seg}, "
-              f"idx={idx}, seg_id={seg['id']}, seg_rs={seg['raw_start']}, "
-              f"seg_re={seg['raw_end']}, _seg_frame_no: {old_fno}->0")
         self.queue.put({
             'type': 'segment_start',
             'seg_id': seg['id'],
             'total_segs': len(self.ref_segs),
         })
 
-    def _score_window(self, scorer):
+    def _send_cycle_complete(self):
+        """汇总本轮所有段的得分、缺陷、纠正建议，发送到 GUI 展示。"""
+        if not self.seg_results:
+            return
+        from dance_scoring.core.correction import JOINT_NAMES_CN
+        # 平均分
+        scores = [r['score'] for r in self.seg_results if r.get('score', 0) > 0]
+        avg_score = sum(scores) / max(len(scores), 1)
+        # 合格统计
+        qualified = sum(1 for r in self.seg_results if r.get('qualified') == '合格')
+        total = len(self.seg_results)
+
+        # 汇总关节偏差（绝对值平均）
+        all_joint_sums: Dict[int, float] = {}
+        all_joint_counts: Dict[int, int] = {}
+        all_corrections: List[str] = []
+        for r in self.seg_results:
+            devs = r.get('joint_deviations', {})
+            for j, d in devs.items():
+                all_joint_sums[j] = all_joint_sums.get(j, 0.0) + abs(d)
+                all_joint_counts[j] = all_joint_counts.get(j, 0) + 1
+            corr = r.get('correction_text', '')
+            if corr:
+                all_corrections.append(corr)
+
+        # 找出偏差最大的 TOP5 关节
+        joint_avgs = {j: all_joint_sums[j] / max(all_joint_counts[j], 1)
+                      for j in all_joint_sums}
+        top_joints = sorted(joint_avgs.items(), key=lambda x: x[1], reverse=True)[:5]
+        weakest = [(j, d, JOINT_NAMES_CN.get(j, f'关节{j}')) for j, d in top_joints
+                   if d > 3.0]
+
+        # 汇总纠正文本（去重取最相关）
+        seen_corr = set()
+        unique_corr = []
+        for c in all_corrections:
+            key = c[:30]
+            if key not in seen_corr:
+                seen_corr.add(key)
+                unique_corr.append(c)
+
+        summary = {
+            'type': 'cycle_complete',
+            'avg_score': round(avg_score, 1),
+            'qualified': qualified,
+            'total': total,
+            'weakest_joints': weakest,
+            'corrections': unique_corr[:3],
+            'seg_results': [{'id': r['segment_id'], 'score': r['score'],
+                            'qualified': r['qualified']}
+                           for r in self.seg_results],
+        }
+        self.queue.put(summary)
+        print(f"[跟练] 本轮完成: 均分{avg_score:.1f}, {qualified}/{total}合格, "
+              f"薄弱部位: {[w[2] for w in weakest[:3]]}")
         from dance_scoring.core.config import ANGLE_JOINTS
         if not self.ref_segs:
             return None
@@ -460,32 +499,34 @@ class LivePanel(ttk.Frame):
     def _build_live(self):
         """跟练双画面界面 — 选择视频后显示。"""
         self._live_frame = ttk.Frame(self._container)
-        main = ttk.Frame(self._live_frame)
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self._main = ttk.Frame(self._live_frame)
+        self._main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # 左侧: 双画面
-        left = ttk.Frame(main)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(left, text="📷 我的画面", font=FONTS["body"],
+        self._left = ttk.Frame(self._main)
+        self._left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(self._left, text="📷 我的画面", font=FONTS["body"],
                  bootstyle="info").pack(anchor=tk.W, pady=(0, 2))
-        self.canvas_user = tk.Canvas(left, width=self.CANVAS_W, height=self.CANVAS_H,
-                                     bg="black", highlightthickness=1,
+        self.canvas_user = tk.Canvas(self._left, width=self.CANVAS_W,
+                                     height=self.CANVAS_H, bg="black",
+                                     highlightthickness=1,
                                      highlightbackground=COLORS["bg_input"])
         self.canvas_user.pack(pady=(0, 4))
-        ttk.Label(left, text="📹 参考示范", font=FONTS["body"],
+        ttk.Label(self._left, text="📹 参考示范", font=FONTS["body"],
                  bootstyle="warning").pack(anchor=tk.W, pady=(4, 2))
-        self.canvas_ref = tk.Canvas(left, width=self.CANVAS_W, height=self.CANVAS_H,
-                                    bg="black", highlightthickness=1,
+        self.canvas_ref = tk.Canvas(self._left, width=self.CANVAS_W,
+                                    height=self.CANVAS_H, bg="black",
+                                    highlightthickness=1,
                                     highlightbackground=COLORS["bg_input"])
         self.canvas_ref.pack()
 
         # 右侧面板
-        right = ttk.Frame(main, width=240)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
-        right.pack_propagate(False)
+        self._right = ttk.Frame(self._main, width=240)
+        self._right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        self._right.pack_propagate(False)
 
         # 段进度
-        f1 = ttk.Labelframe(right, text="📊 进度", padding=8)
+        f1 = ttk.Labelframe(self._right, text="📊 进度", padding=8)
         f1.pack(fill=tk.X, pady=(0, 8))
         self.lbl_segment = ttk.Label(f1, text="段: - / -", font=FONTS["body"])
         self.lbl_segment.pack(anchor=tk.W)
@@ -493,7 +534,7 @@ class LivePanel(ttk.Frame):
         self.lbl_buffer.pack(anchor=tk.W)
 
         # 得分
-        f2 = ttk.Labelframe(right, text="🎯 当前段得分", padding=8)
+        f2 = ttk.Labelframe(self._right, text="🎯 当前段得分", padding=8)
         f2.pack(fill=tk.X, pady=(0, 8))
         self.lbl_score = ttk.Label(f2, text="--.-", font=FONTS["score"])
         self.lbl_score.pack()
@@ -501,16 +542,19 @@ class LivePanel(ttk.Frame):
         self.progress_bar.pack(fill=tk.X, pady=(4, 0))
 
         # 纠正
-        f3 = ttk.Labelframe(right, text="✏️ 纠正建议", padding=8)
+        f3 = ttk.Labelframe(self._right, text="✏️ 纠正建议", padding=8)
         f3.pack(fill=tk.X, pady=(0, 8))
         self.lbl_correction = ttk.Label(f3, text="等待开始...", wraplength=200)
         self.lbl_correction.pack(anchor=tk.W)
 
         # 薄弱
-        f4 = ttk.Labelframe(right, text="💪 薄弱部位", padding=8)
+        f4 = ttk.Labelframe(self._right, text="💪 薄弱部位", padding=8)
         f4.pack(fill=tk.X, pady=(0, 8))
         self.lbl_weak = ttk.Label(f4, text="-", wraplength=200)
         self.lbl_weak.pack(anchor=tk.W)
+
+        # ── 轮次摘要面板（默认隐藏，一轮完成后覆盖右侧）──
+        self._build_summary_panel()
 
         # 底部控制栏
         ctrl = ttk.Frame(self._live_frame, padding=4)
@@ -529,6 +573,139 @@ class LivePanel(ttk.Frame):
                                    bootstyle="secondary")
         self.lbl_status.pack(side=tk.RIGHT, padx=4)
         self._show_placeholders()
+
+    # ── 轮次摘要面板 ──
+
+    def _build_summary_panel(self):
+        """构建轮次完成后的摘要面板（覆盖右侧信息区）。"""
+        self._summary_frame = ttk.Frame(self._main)
+        # 默认隐藏
+
+        inner = ttk.Frame(self._summary_frame, padding=16)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        # 标题
+        self._sum_title = ttk.Label(inner, text="", font=FONTS["heading"])
+        self._sum_title.pack(anchor=tk.W, pady=(0, 4))
+
+        # 总分 + 合格统计
+        self._sum_score = ttk.Label(inner, text="", font=("", 36, "bold"))
+        self._sum_score.pack(anchor=tk.W, pady=(4, 2))
+        self._sum_qual = ttk.Label(inner, text="", font=FONTS["body"])
+        self._sum_qual.pack(anchor=tk.W, pady=(0, 12))
+
+        # 各段得分条
+        ttk.Label(inner, text="── 各段得分 ──", font=FONTS["body_bold"]
+                 ).pack(anchor=tk.W, pady=(0, 4))
+        self._sum_bars = ttk.Frame(inner)
+        self._sum_bars.pack(fill=tk.X, pady=(0, 12))
+
+        # 薄弱部位
+        ttk.Label(inner, text="── 薄弱部位 ──", font=FONTS["body_bold"]
+                 ).pack(anchor=tk.W, pady=(0, 4))
+        self._sum_weak = ttk.Label(inner, text="", font=FONTS["body"],
+                                    wraplength=420)
+        self._sum_weak.pack(anchor=tk.W, pady=(0, 12))
+
+        # 关键纠正建议
+        ttk.Label(inner, text="── 改进建议 ──", font=FONTS["body_bold"]
+                 ).pack(anchor=tk.W, pady=(0, 4))
+        self._sum_corr = ttk.Label(inner, text="", font=FONTS["body"],
+                                    wraplength=420)
+        self._sum_corr.pack(anchor=tk.W, pady=(0, 16))
+
+        # 继续按钮
+        btn_row = ttk.Frame(inner)
+        btn_row.pack(fill=tk.X)
+        self.btn_continue = ttk.Button(btn_row, text="🔄  继续下一轮练习",
+                                       command=self._resume_practice,
+                                       bootstyle="success", style="success.TButton")
+        self.btn_continue.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="⏹  停止练习", command=self._stop,
+                   bootstyle="danger-outline").pack(side=tk.LEFT)
+
+    def _show_summary(self, data: dict):
+        """显示轮次摘要，隐藏左右画面。"""
+        # 隐藏左右
+        self._left.pack_forget()
+        self._right.pack_forget()
+        # 显示摘要
+        self._summary_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 填充数据
+        avg = data.get('avg_score', 0)
+        qualified = data.get('qualified', 0)
+        total = data.get('total', 0)
+        weakest = data.get('weakest_joints', [])
+        corrections = data.get('corrections', [])
+        seg_results = data.get('seg_results', [])
+
+        # 标题
+        if avg >= 80:
+            emoji, grade = "🌟", "优秀"
+        elif avg >= 60:
+            emoji, grade = "✅", "良好"
+        else:
+            emoji, grade = "💪", "需加强"
+        self._sum_title.config(
+            text=f"{emoji} 本轮练习完成 — {grade}")
+
+        # 总分
+        color = COLORS["success"] if avg >= 60 else COLORS["danger"]
+        self._sum_score.config(text=f"{avg:.1f} 分", foreground=color)
+        self._sum_qual.config(
+            text=f"通过: {qualified}/{total} 段  |  "
+                 f"合格率: {int(qualified/max(total,1)*100)}%")
+
+        # 各段得分条
+        for w in self._sum_bars.winfo_children():
+            w.destroy()
+        for r in seg_results:
+            bar_frame = ttk.Frame(self._sum_bars)
+            bar_frame.pack(fill=tk.X, pady=2)
+            ttk.Label(bar_frame, text=f"段{r['id']}", font=("", 9),
+                     width=4, anchor=tk.W).pack(side=tk.LEFT)
+            bar = ttk.Progressbar(bar_frame, mode='determinate', length=160)
+            bar.pack(side=tk.LEFT, padx=4)
+            bar['value'] = min(r['score'], 100)
+            passed = "✅" if r.get('qualified') == '合格' else "❌"
+            ttk.Label(bar_frame, text=f"{r['score']:.0f}{passed}",
+                     font=("", 9)).pack(side=tk.LEFT, padx=4)
+
+        # 薄弱部位
+        if weakest:
+            lines = []
+            for j, d, name in weakest:
+                icon = "🔴" if d > 10 else "🟡"
+                lines.append(f"{icon} {name} (偏差 {d:.1f}°)")
+            self._sum_weak.config(text="\n".join(lines))
+        else:
+            self._sum_weak.config(text="无明显薄弱部位 ✨")
+
+        # 纠正建议
+        if corrections:
+            self._sum_corr.config(
+                text="\n".join(f"⚡ {c[:100]}" for c in corrections))
+        else:
+            self._sum_corr.config(text="全部段表现良好，继续保持！")
+
+        # 更新状态栏
+        self.lbl_status.config(
+            text=f"🏆 本轮均分 {avg:.1f} · 点击继续开始下一轮",
+            bootstyle="success")
+
+    def _hide_summary(self):
+        """隐藏摘要，恢复左右画面。"""
+        self._summary_frame.pack_forget()
+        self._left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        self.lbl_status.config(text="新一轮练习开始...", bootstyle="info")
+
+    def _resume_practice(self):
+        """用户点击继续 → 恢复左右画面 → 通知 worker 继续。"""
+        self._hide_summary()
+        if self._worker and self._worker.is_alive():
+            self._worker.resume()
 
     # ── 模式切换 ──
 
@@ -602,6 +779,11 @@ class LivePanel(ttk.Frame):
             self._show_placeholders()
         except Exception:
             pass
+        # 恢复到练习界面（如果摘要面板正在显示）
+        try:
+            self._hide_summary()
+        except Exception:
+            pass
 
     # ---------- 轮询队列 ----------
 
@@ -640,6 +822,7 @@ class LivePanel(ttk.Frame):
                         self.lbl_buffer.config(text=f"采集: {buf}/{buf_max} 帧")
                         self.progress_bar['value'] = min(buf / buf_max * 100, 100)
                     elif t == 'summary':
+                        # 兼容旧的 summary 消息：仅更新状态栏
                         results = msg.get('seg_results', [])
                         if results:
                             scores = [r['score'] for r in results if r.get('score', 0) > 0]
@@ -647,6 +830,9 @@ class LivePanel(ttk.Frame):
                                 avg = sum(scores) / len(scores)
                                 p = sum(1 for r in results if r.get('qualified') == '合格')
                                 self.lbl_status.config(text=f"🏆 均分:{avg:.1f} | 通过:{p}/{len(results)}")
+                    elif t == 'cycle_complete':
+                        # 新的轮次完成消息：显示详细摘要面板
+                        self._show_summary(msg)
                 except Exception:
                     pass  # widget 可能已被销毁
         except queue.Empty:
