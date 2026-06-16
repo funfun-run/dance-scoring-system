@@ -1,10 +1,30 @@
-# gui/components.py — 可复用 GUI 组件
+# gui/components.py — 可复用 GUI 组件 (ttkbootstrap 主题)
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from typing import Optional
 import cv2
 from PIL import Image, ImageTk
 import os
+import subprocess
+
+from dance_scoring.gui.theme import COLORS, FONTS
+
+def _open_dir(path: str):
+    """跨平台打开目录。"""
+    if os.path.isdir(path):
+        if os.name == 'nt':
+            os.startfile(path)
+        else:
+            subprocess.Popen(['xdg-open', path])
+    else:
+        os.makedirs(path, exist_ok=True)
+        if os.name == 'nt':
+            os.startfile(path)
+        else:
+            subprocess.Popen(['xdg-open', path])
 
 
 class VideoPreview(tk.Frame):
@@ -188,8 +208,10 @@ class ScoreResultDialog(tk.Toplevel):
         else:
             grade = "💪需重练"
 
-        tk.Label(main, text=f"总评: {overall:.1f}/100  {grade}",
-                 font=("", 14, "bold")).pack(pady=(0, 4))
+        ttk.Label(main, text=f"{overall:.1f}",
+                 font=FONTS["score"], bootstyle="primary").pack()
+        ttk.Label(main, text=f"总评: {grade}",
+                 font=("", 14, "bold"), bootstyle="primary").pack(pady=(0, 4))
 
         info = f"参考帧数: {r['ref_frames']}  |  用户帧数: {r['user_frames']}  |  DTW对齐: {r['path_len']}对"
         tk.Label(main, text=info, fg="gray").pack(pady=(0, 12))
@@ -227,17 +249,13 @@ class ScoreResultDialog(tk.Toplevel):
         btn_frame = tk.Frame(main)
         btn_frame.pack(pady=4)
         tk.Button(btn_frame, text="打开练习视频目录",
-                  command=lambda: self._open_dir("output/low_score_clips")).pack(side=tk.LEFT, padx=4)
+                  command=lambda: _open_dir("output/low_score_clips")).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_frame, text="打开分段目录",
-                  command=lambda: self._open_dir("output/segments")).pack(side=tk.LEFT, padx=4)
+                  command=lambda: _open_dir("output/segments")).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_frame, text="关闭", command=self.destroy).pack(side=tk.LEFT, padx=4)
 
-    def _open_dir(self, relative_path):
-        path = os.path.join(os.getcwd(), relative_path)
-        if os.path.isdir(path):
-            os.startfile(path)
-        else:
-            messagebox.showinfo("提示", f"目录不存在: {path}")
+    def _open_dir_deprecated(self, relative_path):
+        _open_dir(os.path.join(os.getcwd(), relative_path))
 
 
 class SegmentListDialog(tk.Toplevel):
@@ -383,3 +401,215 @@ class SegmentListDialog(tk.Toplevel):
     def _on_close(self):
         self._stop_seg_play()
         self.destroy()
+
+
+# ============================================================
+# HUD 运动风新增组件
+# ============================================================
+
+VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')
+
+class VideoImporter(ttk.Frame):
+    """视频导入组件 — 点击选择 + 最近文件列表。"""
+
+    DROP_H = 120
+
+    def __init__(self, master, label="视频", on_select=None):
+        super().__init__(master)
+        self._label = label
+        self._callback = on_select
+        self._selected: Optional[str] = None
+        self._build()
+
+    def _build(self):
+        l = ttk.Label(self, text=f"📹 {self._label}", font=FONTS["body_bold"])
+        l.pack(anchor=tk.W, pady=(0, 4))
+
+        self.drop_frame = tk.Frame(self, bg=COLORS["card"], height=self.DROP_H,
+                                   highlightthickness=1,
+                                   highlightbackground=COLORS["border"])
+        self.drop_frame.pack(fill=tk.X)
+        self.drop_frame.pack_propagate(False)
+
+        self.drop_label = tk.Label(
+            self.drop_frame, text="📹\n点击选择视频文件",
+            bg=COLORS["card"], fg=COLORS["text_muted"],
+            font=FONTS["body"], justify=tk.CENTER, cursor="hand2")
+        self.drop_label.pack(expand=True)
+
+        for w in [self.drop_frame, self.drop_label]:
+            w.bind("<Button-1>", self._on_click)
+
+        self.info_label = tk.Label(self, text="", bg=COLORS["bg"],
+                                   fg=COLORS["text_secondary"], font=FONTS["small"],
+                                   anchor=tk.W)
+
+        # 最近列表
+        ttk.Label(self, text="── 最近视频 ──", font=FONTS["small"],
+                 foreground=COLORS["text_muted"]).pack(anchor=tk.W, pady=(6, 2))
+        self.recent_frame = ttk.Frame(self)
+        self.recent_frame.pack(fill=tk.X)
+        try:
+            self._populate_recent()
+        except Exception:
+            ttk.Label(self.recent_frame, text="  (扫描视频目录失败)",
+                     font=FONTS["small"], foreground=COLORS["text_muted"]).pack()
+
+    def _on_click(self, event=None):
+        path = filedialog.askopenfilename(
+            title=f"选择{self._label}",
+            filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                       ("所有文件", "*.*")])
+        if path:
+            self.set_file(path)
+
+    def _populate_recent(self):
+        import cv2
+        candidates = []
+        for d in ["videos", os.path.expanduser("~/Videos"),
+                  os.path.expanduser("~/Video")]:
+            if os.path.isdir(d):
+                for fn in os.listdir(d):
+                    if fn.lower().endswith(VIDEO_EXTS):
+                        candidates.append(os.path.join(d, fn))
+        seen = set()
+        for p in candidates[:8]:
+            if p not in seen:
+                seen.add(p)
+                try:
+                    cap = cv2.VideoCapture(p)
+                    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                    dur = frames / fps if fps > 0 else 0
+                    cap.release()
+                    dur_s = f"{int(dur)}s"
+                    fn = os.path.basename(p)[:25]
+                    text = f"  📹 {fn}  {dur_s}  {frames}帧"
+                except Exception:
+                    text = f"  📹 {os.path.basename(p)[:30]}"
+
+                row = ttk.Label(self.recent_frame, text=text, font=FONTS["small"],
+                               anchor=tk.W, cursor="hand2")
+                row.pack(fill=tk.X, pady=1)
+                row.bind("<Button-1>", lambda e, path=p: self.set_file(path))
+
+        browse_btn = ttk.Label(self.recent_frame, text="  📂 浏览其他文件...",
+                              font=FONTS["small"], foreground=COLORS["accent"],
+                              cursor="hand2", anchor=tk.W)
+        browse_btn.pack(fill=tk.X, pady=(2, 0))
+        browse_btn.bind("<Button-1>", self._on_click)
+
+    def set_file(self, path: str):
+        import cv2
+        self._selected = path
+        fn = os.path.basename(path)[:35]
+        try:
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                info = fn
+            else:
+                frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                dur = frames / fps if fps > 0 else 0
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                cap.release()
+                info = f"{fn}\n{frames}帧 · {dur:.1f}s · {w}×{h} · {fps:.0f}fps"
+        except Exception:
+            info = fn
+
+        self.drop_label.config(text=f"📹\n{info}", fg=COLORS["text"])
+        self.drop_frame.config(highlightbackground=COLORS["success"],
+                               highlightthickness=2)
+        self.info_label.config(text=f"✅ 已选: {fn}")
+        self.info_label.pack(fill=tk.X, pady=(2, 0))
+
+        if self._callback:
+            self._callback(path)
+
+    def get_file(self) -> Optional[str]:
+        return self._selected
+
+    def clear(self):
+        self._selected = None
+        self.drop_label.config(text="📹\n点击选择视频文件",
+                              fg=COLORS["text_muted"])
+        self.drop_frame.config(highlightbackground=COLORS["border"],
+                               highlightthickness=1)
+        self.info_label.pack_forget()
+
+
+class ScoreDisplay(ttk.Frame):
+    """大号得分显示 — 颜色按阈值自动切换。"""
+
+    def __init__(self, master, size="medium"):
+        super().__init__(master)
+        font = FONTS["score_medium"] if size == "medium" else FONTS["score_large"]
+        self.lbl_score = ttk.Label(self, text="--.-", font=font, bootstyle="primary")
+        self.lbl_score.pack()
+        self.lbl_grade = ttk.Label(self, text="", font=FONTS["body"], bootstyle="secondary")
+        self.lbl_grade.pack()
+
+    def set(self, score: float, threshold: float = 60.0):
+        if score <= 0:
+            self.lbl_score.config(text="--.-", bootstyle="primary")
+            self.lbl_grade.config(text="")
+            return
+        self.lbl_score.config(text=f"{score:.1f}")
+        if score >= threshold:
+            self.lbl_score.config(bootstyle="success")
+            grade = "⭐ 优秀" if score >= 85 else "👍 合格"
+            self.lbl_grade.config(text=grade, bootstyle="success")
+        else:
+            self.lbl_score.config(bootstyle="danger")
+            grade = "⚠️ 需改进" if score >= 40 else "💪 需重练"
+            self.lbl_grade.config(text=grade, bootstyle="danger")
+
+
+class SegmentBar(tk.Frame):
+    """段得分水平条 — 绿/红色按分数填充，可点击。"""
+
+    BAR_H = 32
+
+    def __init__(self, master, seg_id: int, score: float, start_time: float,
+                 end_time: float, threshold: float = 60.0, on_click=None):
+        super().__init__(master, bg=COLORS["bg"])
+        self.seg_id = seg_id
+        self._threshold = threshold
+        self._on_click = on_click
+        self._build(score, start_time, end_time)
+
+    def _build(self, score, start_time, end_time):
+        passed = score >= self._threshold
+        fill_color = COLORS["success"] if passed else COLORS["danger"]
+        fill_pct = min(100, max(2, score))
+        cw = 160
+
+        # 段号
+        l1 = tk.Label(self, text=f"段{self.seg_id}", font=FONTS["body_bold"],
+                     bg=COLORS["bg"], fg=COLORS["text"], width=4, anchor=tk.W)
+        l1.pack(side=tk.LEFT)
+
+        # Canvas 条
+        cv = tk.Canvas(self, width=cw, height=self.BAR_H,
+                      bg=COLORS["input_bg"], highlightthickness=0)
+        cv.pack(side=tk.LEFT, padx=4)
+        cv.create_rectangle(0, 0, int(cw * fill_pct / 100), self.BAR_H,
+                           fill=fill_color, outline="")
+        cv.create_text(cw // 2, self.BAR_H // 2, text=f"{score:.1f}",
+                      fill=COLORS["text"], font=FONTS["body_bold"])
+
+        # 图标
+        icon = tk.Label(self, text="✅" if passed else "❌", font=("", 14),
+                       bg=COLORS["bg"])
+        icon.pack(side=tk.LEFT, padx=4)
+
+        # 时间
+        tl = tk.Label(self, text=f"{start_time:.1f}s-{end_time:.1f}s",
+                     font=FONTS["small"], bg=COLORS["bg"], fg=COLORS["text_muted"])
+        tl.pack(side=tk.LEFT, padx=4)
+
+        # 点击事件
+        for w in [self, l1, cv, icon, tl]:
+            w.bind("<Button-1>", lambda e, sid=self.seg_id:
+                   self._on_click and self._on_click(sid))

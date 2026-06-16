@@ -1,0 +1,750 @@
+# gui/live_view.py — 实时跟练界面 (v3 — 双画面版)
+#
+# 布局: 左上「我的画面」(摄像头) + 左下「参考示范」(当前段循环)
+#       右侧 得分 / 纠正 / 薄弱部位
+#       底部 控制栏
+#
+# v3: 加入参考示范画面，用户可以对照练习
+
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+import threading
+import queue
+import time
+import os
+from typing import Optional, List, Dict
+
+import numpy as np
+import cv2
+
+from dance_scoring.gui.theme import COLORS, FONTS
+
+VIDEO_FILTERS = [("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                 ("所有文件", "*.*")]
+
+# ============================================================
+# 骨骼叠加绘制
+# ============================================================
+
+class PoseOverlay:
+    POSE_CONNECTIONS = [
+        (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+        (11, 23), (12, 24), (23, 24),
+        (23, 25), (25, 27), (24, 26), (26, 28),
+        (27, 29), (27, 31), (28, 30), (28, 32),
+        (15, 17), (15, 19), (15, 21), (16, 18), (16, 20), (16, 22),
+        (0, 1), (1, 2), (2, 3), (0, 4), (4, 5), (5, 6),
+        (1, 7), (4, 8), (9, 10),
+    ]
+
+    @staticmethod
+    def draw(frame_bgr, landmarks, weak_joints=None):
+        weak_joints = set(weak_joints or [])
+        h, w = frame_bgr.shape[:2]
+        for a, b in PoseOverlay.POSE_CONNECTIONS:
+            pa, pb = landmarks[a], landmarks[b]
+            if (0 <= pa[0] < w and 0 <= pa[1] < h and
+                0 <= pb[0] < w and 0 <= pb[1] < h):
+                cv2.line(frame_bgr, (int(pa[0]), int(pa[1])),
+                         (int(pb[0]), int(pb[1])), (255, 255, 255), 1)
+        for i, pt in enumerate(landmarks):
+            if 0 <= pt[0] < w and 0 <= pt[1] < h:
+                color = (0, 0, 255) if i in weak_joints else (0, 255, 0)
+                cv2.circle(frame_bgr, (int(pt[0]), int(pt[1])), 3, color, -1)
+        return frame_bgr
+
+
+# ============================================================
+# 后台工作线程
+# ============================================================
+
+class LiveWorker(threading.Thread):
+
+    def __init__(self, ref_path: str, result_queue: queue.Queue,
+                 camera_id: int = 0, bpm: int = 120,
+                 alignment: str = "fastdtw"):
+        super().__init__(daemon=True)
+        self.ref_path = ref_path
+        self.queue = result_queue
+        self.camera_id = camera_id
+        self.bpm = bpm
+        self.alignment = alignment
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
+        try:
+            if hasattr(self, 'camera') and self.camera:
+                self.camera.close()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            self._setup()
+            self._loop()
+        except Exception as e:
+            import traceback
+            self.queue.put({'type': 'error',
+                           'message': f"{e}\n{traceback.format_exc()}"})
+        finally:
+            self._cleanup()
+
+    # ======== 初始化 ========
+
+    def _setup(self):
+        # 摄像头
+        from dance_scoring.camera.usb import UsbCamera
+        self.camera = UsbCamera(device_id=self.camera_id)
+        if not self.camera.open():
+            self.queue.put({'type': 'error',
+                           'message': f'无法打开摄像头 (device_id={self.camera_id})'})
+            raise RuntimeError('摄像头打开失败')
+
+        self.queue.put({'type': 'status', 'message': '📷 摄像头已打开'})
+
+        # 姿态提取器
+        from dance_scoring.core.extractor import PoseExtractor, download_model
+        from dance_scoring.core.config import Config
+        download_model()
+        self.extractor = PoseExtractor(Config())
+        self.queue.put({'type': 'status', 'message': '📐 姿态模型已加载'})
+
+        # 参考视频 → 预提取姿态序列 (用于打分), 原始帧按需加载 (用于显示)
+        self.queue.put({'type': 'status',
+                        'message': f'📹 加载参考视频...'})
+
+        self.ref_poses = self.extractor.extract(self.ref_path)
+        nref = len(self.ref_poses)
+
+        # 按八拍分段，只存每个段的帧索引范围
+        from dance_scoring.core.config import BEATS_PER_SEGMENT, TARGET_FPS
+        spb = 60.0 / self.bpm
+        sps = spb * BEATS_PER_SEGMENT
+        fps = max(1, int(sps * TARGET_FPS))
+
+        # 一次性读取全部原始帧到内存，避免 cv2.CAP_PROP_POS_FRAMES
+        # 在非零位置 seek 不准确的问题（H.264 关键帧限制）
+        self.queue.put({'type': 'status',
+                        'message': '📹 缓存参考视频帧...'})
+        cap = cv2.VideoCapture(self.ref_path)
+        self._all_raw_frames: list = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            self._all_raw_frames.append(frame)
+        cap.release()
+        raw_total = max(len(self._all_raw_frames), 1)
+        ratio = raw_total / max(nref, 1)
+
+        self.ref_segs = []
+        for sid in range(max(1, (nref + fps - 1) // fps)):
+            ps, pe = sid * fps, min((sid + 1) * fps, nref)
+            rs = int(ps * ratio)
+            re = max(int(pe * ratio), rs + 1)
+            self.ref_segs.append({
+                'id': sid + 1,
+                'start': ps, 'end': pe,
+                'raw_start': rs, 'raw_end': re,
+            })
+
+        print(f"[DEBUG] _setup: nref={nref}, raw_total={raw_total}, ratio={ratio:.3f}, "
+              f"fps={fps}, num_segs={len(self.ref_segs)}")
+        for s in self.ref_segs:
+            print(f"  段{s['id']}: pose[{s['start']}:{s['end']}] "
+                  f"raw[{s['raw_start']}:{s['raw_end']}] "
+                  f"(raw={s['raw_end']-s['raw_start']}, pose={s['end']-s['start']})")
+
+        # 从内存切片加载第一段帧
+        self._ref_raw_cache = []
+        self._ref_raw_seg_id = 0
+        self._load_seg_raw_frames(0)
+
+        self.queue.put({
+            'type': 'status',
+            'message': f'📐 参考: {nref}姿态帧, {len(self.ref_segs)}段',
+        })
+
+        # 滑动窗口（window_step = window_max 确保每段从头开始收集完整的 150 帧，
+        # 避免前一段的旧帧混入，导致后续段参考视频只显示极少数帧）
+        self.window: List = []
+        self.window_max = 150
+        self.window_step = self.window_max  # 每段清空窗口，独立收集
+        self.current_seg = 0
+        self.seg_results: List[Dict] = []
+        self.frame_counter = 0
+        self._seg_frame_no = 0  # 当前段内帧计数 (不受窗口切片影响)
+
+    # ======== 主循环 ========
+
+    def _loop(self):
+        import mediapipe as mp
+        from dance_scoring.core.frame import PoseFrame
+        from dance_scoring.core.scorer import Scorer
+        from dance_scoring.core.config import Config, Z_AXIS_WEIGHT
+
+        scorer_cfg = Config()
+        scorer = Scorer(scorer_cfg, bpm=self.bpm, alignment_method=self.alignment)
+
+        # 发送第一段开始信号
+        self._send_segment_start()
+
+        while not self._cancel.is_set():
+            try:
+                user_frame = self.camera.read()
+            except Exception:
+                break
+            if user_frame is None:
+                if self._cancel.is_set():
+                    break
+                time.sleep(0.05)
+                continue
+
+            # 单帧姿态提取
+            pf = self._extract_frame(user_frame)
+            if pf is not None:
+                self.window.append(pf)
+                self._seg_frame_no += 1
+
+                # 窗口满 → 打分 → 切换下一段
+                if len(self.window) >= self.window_max:
+                    result = self._score_window(scorer)
+                    if result:
+                        self.seg_results.append(result)
+                        self.current_seg = result.get('segment_id',
+                                                      self.current_seg)
+                        # 终端日志
+                        print(f"[跟练] 段{result['segment_id']} 得分:{result['score']:.1f} "
+                              f"{result['qualified']} | {result['correction_text'][:50]}")
+                        data = {'type': 'result', 'user_frame': user_frame, **result}
+                        self.queue.put(data)
+
+                        if self.current_seg >= len(self.ref_segs):
+                            self.queue.put({
+                                'type': 'summary',
+                                'seg_results': list(self.seg_results),
+                            })
+                            print(f"[跟练] 全部 {len(self.ref_segs)} 段完成，重新开始")
+                            self.current_seg = 0
+                            self.seg_results = []
+                        self._send_segment_start()
+                    self.window = self.window[self.window_step:]
+
+            # 获取当前段的参考帧 (循环播放)
+            ref_frame = self._get_current_ref_frame()
+
+            # 推送双画面
+            self.queue.put({
+                'type': 'dual_frame',
+                'user_frame': user_frame,
+                'ref_frame': ref_frame,
+                'seg_id': self.current_seg + 1,
+                'total_segs': len(self.ref_segs),
+                'buffer_fill': len(self.window),
+                'buffer_max': self.window_max,
+            })
+
+    def _extract_frame(self, rgb_frame):
+        import mediapipe as mp
+        from dance_scoring.core.frame import PoseFrame
+        from dance_scoring.core.config import Z_AXIS_WEIGHT
+        try:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            ts = int(time.time() * 1000) % (2**31)
+            res = self.extractor.det.detect_for_video(mp_img, ts)
+            if (res.pose_world_landmarks and
+                    len(res.pose_world_landmarks) > 0 and
+                    len(res.pose_world_landmarks[0]) >= 33):
+                kp3d = np.zeros((33, 3), dtype=np.float32)
+                cf = np.zeros(33, dtype=np.float32)
+                for i, lm in enumerate(res.pose_world_landmarks[0][:33]):
+                    kp3d[i] = [lm.x, lm.y, lm.z * Z_AXIS_WEIGHT]
+                    cf[i] = lm.visibility if hasattr(lm, 'visibility') else 1.0
+                self.frame_counter += 1
+                return PoseFrame(self.frame_counter, kp3d, cf)
+        except Exception:
+            pass
+        return None
+
+    def _load_seg_raw_frames(self, seg_idx):
+        """从内存切片加载指定段的原始视频帧（无 seek，避免关键帧定位问题）。"""
+        if seg_idx >= len(self.ref_segs):
+            return
+        seg = self.ref_segs[seg_idx]
+        rs, re = seg['raw_start'], seg['raw_end']
+        # 从一次性预读的帧列表中切片
+        all_frames = getattr(self, '_all_raw_frames', [])
+        rs = max(0, min(rs, len(all_frames)))
+        re = max(rs + 1, min(re, len(all_frames)))
+        self._ref_raw_cache = all_frames[rs:re]
+        self._ref_raw_seg_id = seg_idx
+        print(f"[DEBUG] _load_seg_raw_frames: seg_idx={seg_idx}, "
+              f"seg_id={seg['id']}, raw_start={seg['raw_start']}->{rs}, "
+              f"raw_end={seg['raw_end']}->{re}, cache_size={len(self._ref_raw_cache)}, "
+              f"all_frames_total={len(all_frames)}")
+
+    def _get_current_ref_frame(self):
+        """获取当前段当前应显示的参考视频帧 (循环播放)。"""
+        if not self.ref_segs:
+            return None
+        idx = min(self.current_seg, len(self.ref_segs) - 1)
+        # 切换段时重新加载
+        if idx != self._ref_raw_seg_id:
+            self._load_seg_raw_frames(idx)
+            print(f"[DEBUG] _get_current_ref_frame: 加载新段 idx={idx}, "
+                  f"cache_size={len(self._ref_raw_cache)}")
+        if not self._ref_raw_cache:
+            return None
+        pos = self._seg_frame_no % max(len(self._ref_raw_cache), 1)
+        if pos == 0 or self._seg_frame_no == 0:
+            print(f"[DEBUG] _get_current_ref_frame: idx={idx}, "
+                  f"_seg_frame_no={self._seg_frame_no}, pos={pos}, "
+                  f"cache_size={len(self._ref_raw_cache)}, "
+                  f"rs={self.ref_segs[idx]['raw_start']}, "
+                  f"re={self.ref_segs[idx]['raw_end']}")
+        return self._ref_raw_cache[pos]
+
+    def _send_segment_start(self):
+        if not self.ref_segs:
+            return
+        old_fno = self._seg_frame_no
+        self._seg_frame_no = 0
+        idx = min(self.current_seg, len(self.ref_segs) - 1)
+        seg = self.ref_segs[idx]
+        print(f"[DEBUG] _send_segment_start: current_seg={self.current_seg}, "
+              f"idx={idx}, seg_id={seg['id']}, seg_rs={seg['raw_start']}, "
+              f"seg_re={seg['raw_end']}, _seg_frame_no: {old_fno}->0")
+        self.queue.put({
+            'type': 'segment_start',
+            'seg_id': seg['id'],
+            'total_segs': len(self.ref_segs),
+        })
+
+    def _score_window(self, scorer):
+        from dance_scoring.core.config import ANGLE_JOINTS
+        if not self.ref_segs:
+            return None
+        idx = min(self.current_seg, len(self.ref_segs) - 1)
+        seg = self.ref_segs[idx]
+        ref_seg = self.ref_poses[seg['start']:seg['end']]
+        if len(ref_seg) < 5:
+            self.current_seg = min(self.current_seg + 1, len(self.ref_segs) - 1)
+            return None
+
+        overall, segs, low, path = scorer.score(ref_seg, self.window)
+
+        # 关节偏差
+        joint_sums, joint_counts = {}, {}
+        for ri, ui in path:
+            ra = ref_seg[ri].angles
+            ua = self.window[ui].angles
+            for j, (a, b, c) in enumerate(ANGLE_JOINTS):
+                dev = float(ua[j] - ra[j])
+                for ji in [a, b, c]:
+                    joint_sums[ji] = joint_sums.get(ji, 0.) + dev
+                    joint_counts[ji] = joint_counts.get(ji, 0) + 1
+        devs = {j: joint_sums[j] / max(joint_counts[j], 1) for j in joint_sums}
+
+        # 纠正建议
+        from dance_scoring.core.correction import generate_correction
+        class S:
+            pass
+        s = S()
+        s.id = seg['id']
+        s.score = segs[0]['score'] if segs else 0
+        s.joint_deviations = devs
+        corr = generate_correction([s], top_n=3, threshold_deg=10.0)
+
+        return {
+            'segment_id': seg['id'],
+            'score': segs[0]['score'] if segs else 0,
+            'qualified': ('合格' if (segs[0]['score'] if segs else 0) >= 60
+                          else '不合格'),
+            'joint_deviations': devs,
+            'correction_text': corr.get(seg['id'], ''),
+            'path_length': len(path),
+        }
+
+    def _cleanup(self):
+        if hasattr(self, 'camera') and self.camera:
+            self.camera.close()
+        # 释放预加载的全部视频帧内存
+        if hasattr(self, '_all_raw_frames'):
+            self._all_raw_frames = []
+
+
+# ============================================================
+# 实时跟练 Panel
+# ============================================================
+
+class LivePanel(ttk.Frame):
+
+    CANVAS_W = 320
+    CANVAS_H = 240
+
+    def __init__(self, master, reference_path: str = ""):
+        super().__init__(master)
+        self._ref_path = reference_path
+        self._running = False
+        self._worker: Optional[LiveWorker] = None
+        self._queue: queue.Queue = queue.Queue()
+        self._ref_seg_count = 0
+        self._tk_img_user = None
+        self._tk_img_ref = None
+        self._last_result = None
+        self._container = None
+        self._import_frame = None
+        self._live_frame = None
+        self._import_video = None
+        self._build()
+
+    def _build(self):
+        self._container = ttk.Frame(self)
+        self._container.pack(fill=tk.BOTH, expand=True)
+
+        # ── 导入界面 (默认显示) ──
+        self._build_import()
+        # ── 跟练界面 (选择视频后才显示) ──
+        self._build_live()
+
+        if self._ref_path and os.path.exists(self._ref_path):
+            self._show_live()
+        else:
+            self._show_import()
+
+    def _build_import(self):
+        """视频导入界面 — 首次打开时显示。"""
+        self._import_frame = ttk.Frame(self._container)
+        inner = ttk.Frame(self._import_frame, padding=20)
+        inner.pack(expand=True)
+        ttk.Label(inner, text="🎬", font=FONTS["icon"]).pack()
+        ttk.Label(inner, text="实时跟练", font=FONTS["heading"]).pack(pady=(8, 4))
+        ttk.Label(inner, text="选择参考视频后即可开始对照练习",
+                 font=FONTS["body"], foreground=COLORS["text_secondary"]
+                 ).pack(pady=(0, 12))
+
+        # 大号导入按钮 — 最直观的入口
+        self.btn_select_ref = ttk.Button(
+            inner,
+            text="📁  选择参考视频",
+            command=self._sel_ref_file,
+            bootstyle="warning",
+            style="warning.TButton",
+        )
+        self.btn_select_ref.pack(pady=4)
+
+        # 选中后显示文件名 + 进入跟练按钮
+        self.lbl_selected = ttk.Label(inner, text="",
+                                      font=FONTS["body"], foreground=COLORS["success"])
+        self.lbl_selected.pack(pady=(8, 0))
+        self.btn_go_live = ttk.Button(inner, text="▶  开始跟练",
+                                       command=self._show_live,
+                                       bootstyle="success", width=20)
+        self.btn_go_live.pack(pady=4)
+        self.btn_go_live.config(state=tk.DISABLED)
+
+        # 如果已有路径，预填充
+        if self._ref_path and os.path.exists(self._ref_path):
+            self._on_import_select(self._ref_path)
+
+    def _sel_ref_file(self):
+        path = filedialog.askopenfilename(
+            title="选择参考视频",
+            filetypes=VIDEO_FILTERS)
+        if path:
+            self._on_import_select(path)
+
+    def _build_live(self):
+        """跟练双画面界面 — 选择视频后显示。"""
+        self._live_frame = ttk.Frame(self._container)
+        main = ttk.Frame(self._live_frame)
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 左侧: 双画面
+        left = ttk.Frame(main)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(left, text="📷 我的画面", font=FONTS["body"],
+                 bootstyle="info").pack(anchor=tk.W, pady=(0, 2))
+        self.canvas_user = tk.Canvas(left, width=self.CANVAS_W, height=self.CANVAS_H,
+                                     bg="black", highlightthickness=1,
+                                     highlightbackground=COLORS["bg_input"])
+        self.canvas_user.pack(pady=(0, 4))
+        ttk.Label(left, text="📹 参考示范", font=FONTS["body"],
+                 bootstyle="warning").pack(anchor=tk.W, pady=(4, 2))
+        self.canvas_ref = tk.Canvas(left, width=self.CANVAS_W, height=self.CANVAS_H,
+                                    bg="black", highlightthickness=1,
+                                    highlightbackground=COLORS["bg_input"])
+        self.canvas_ref.pack()
+
+        # 右侧面板
+        right = ttk.Frame(main, width=240)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
+        right.pack_propagate(False)
+
+        # 段进度
+        f1 = ttk.Labelframe(right, text="📊 进度", padding=8)
+        f1.pack(fill=tk.X, pady=(0, 8))
+        self.lbl_segment = ttk.Label(f1, text="段: - / -", font=FONTS["body"])
+        self.lbl_segment.pack(anchor=tk.W)
+        self.lbl_buffer = ttk.Label(f1, text="采集: 0/0 帧", font=("", 9))
+        self.lbl_buffer.pack(anchor=tk.W)
+
+        # 得分
+        f2 = ttk.Labelframe(right, text="🎯 当前段得分", padding=8)
+        f2.pack(fill=tk.X, pady=(0, 8))
+        self.lbl_score = ttk.Label(f2, text="--.-", font=FONTS["score"])
+        self.lbl_score.pack()
+        self.progress_bar = ttk.Progressbar(f2, mode='determinate', length=180)
+        self.progress_bar.pack(fill=tk.X, pady=(4, 0))
+
+        # 纠正
+        f3 = ttk.Labelframe(right, text="✏️ 纠正建议", padding=8)
+        f3.pack(fill=tk.X, pady=(0, 8))
+        self.lbl_correction = ttk.Label(f3, text="等待开始...", wraplength=200)
+        self.lbl_correction.pack(anchor=tk.W)
+
+        # 薄弱
+        f4 = ttk.Labelframe(right, text="💪 薄弱部位", padding=8)
+        f4.pack(fill=tk.X, pady=(0, 8))
+        self.lbl_weak = ttk.Label(f4, text="-", wraplength=200)
+        self.lbl_weak.pack(anchor=tk.W)
+
+        # 底部控制栏
+        ctrl = ttk.Frame(self._live_frame, padding=4)
+        ctrl.pack(side=tk.BOTTOM, fill=tk.X)
+        self.btn_start = ttk.Button(ctrl, text="▶ 开始", command=self._start,
+                                    bootstyle="success", width=8)
+        self.btn_start.pack(side=tk.LEFT, padx=2)
+        self.btn_stop = ttk.Button(ctrl, text="⏹ 停止", command=self._stop,
+                                   bootstyle="danger-outline", width=8)
+        self.btn_stop.pack(side=tk.LEFT, padx=2)
+        ttk.Separator(ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(ctrl, text="📁 换参考", command=self._show_import,
+                   bootstyle="secondary-outline", width=9).pack(side=tk.LEFT, padx=2)
+
+        self.lbl_status = ttk.Label(ctrl, text="就绪 · 请点击 ▶ 开始",
+                                   bootstyle="secondary")
+        self.lbl_status.pack(side=tk.RIGHT, padx=4)
+        self._show_placeholders()
+
+    # ── 模式切换 ──
+
+    def _show_import(self):
+        self._running = False
+        if self._worker:
+            self._worker.cancel()
+            self._worker = None
+        if self._live_frame:
+            self._live_frame.pack_forget()
+        self._import_frame.pack(fill=tk.BOTH, expand=True)
+        if self._ref_path and os.path.exists(self._ref_path):
+            self._on_import_select(self._ref_path)
+        else:
+            self._ref_path = ""
+            self.lbl_selected.config(text="")
+            self.btn_go_live.config(state=tk.DISABLED)
+
+    def _show_live(self):
+        if not self._ref_path or not os.path.exists(self._ref_path):
+            messagebox.showwarning("提示", "请先选择参考视频")
+            return
+        self._import_frame.pack_forget()
+        self._live_frame.pack(fill=tk.BOTH, expand=True)
+        self.lbl_status.config(
+            text=f"参考: {os.path.basename(self._ref_path)[:20]} · 请点击 ▶ 开始",
+            bootstyle="info")
+
+    def _on_import_select(self, path):
+        self._ref_path = path
+        self.btn_go_live.config(state=tk.NORMAL)
+        self.btn_go_live.config(text=f"▶  开始跟练 — {os.path.basename(path)[:15]}")
+
+    def set_reference(self, path: str):
+        self._ref_path = path
+        if path and os.path.exists(path):
+            self._on_import_select(path)
+            self._show_live()
+
+    # ---------- 控制 ----------
+
+    def _start(self):
+        if not self._ref_path or not os.path.exists(self._ref_path):
+            messagebox.showwarning("提示", "请先选择参考视频")
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._running = True
+        self._last_result = None
+        self.btn_start.config(state=tk.DISABLED)
+        self.lbl_status.config(text="初始化中...", bootstyle="info")
+        self._queue = queue.Queue()
+        self._worker = LiveWorker(self._ref_path, self._queue, camera_id=0)
+        self._worker.start()
+        self.after(100, self._poll)
+
+    def _stop(self):
+        self._running = False
+        if self._worker:
+            self._worker.cancel()
+            self._worker = None
+        try:
+            self.btn_start.config(state=tk.NORMAL)
+        except Exception:
+            pass
+        try:
+            self.lbl_status.config(text="已停止", bootstyle="secondary")
+        except Exception:
+            pass
+        try:
+            self._show_placeholders()
+        except Exception:
+            pass
+
+    # ---------- 轮询队列 ----------
+
+    def _poll(self):
+        if not self._running:
+            return
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                t = msg.get('type', '')
+                try:
+                    if t == 'error':
+                        messagebox.showerror("跟练错误", msg.get('message', '未知错误'))
+                        self._stop()
+                    elif t == 'status':
+                        self.lbl_status.config(text=str(msg.get('message', ''))[:40])
+                    elif t == 'segment_start':
+                        self._ref_seg_count = msg.get('total_segs', self._ref_seg_count)
+                        sid = msg.get('seg_id', 0)
+                        self.lbl_segment.config(text=f"▶ 段: {sid} / {max(self._ref_seg_count,1)}")
+                        self.lbl_score.config(text="--.-", bootstyle="primary")
+                        self.lbl_correction.config(text="跟练中...")
+                    elif t == 'result':
+                        self._last_result = msg
+                        self._ref_seg_count = max(self._ref_seg_count, msg.get('segment_id', 0))
+                        print(f"[GUI] 收到段{msg.get('segment_id',0)}结果 得分:{msg.get('score',0):.1f}")
+                        self._update_display(msg)
+                    elif t == 'dual_frame':
+                        uf, rf = msg.get('user_frame'), msg.get('ref_frame')
+                        if uf is not None:
+                            self._draw_canvas(self.canvas_user, uf, 'user', msg)
+                        if rf is not None:
+                            self._draw_canvas(self.canvas_ref, rf, 'ref', msg)
+                        buf = msg.get('buffer_fill', 0)
+                        buf_max = max(msg.get('buffer_max', 1), 1)
+                        self.lbl_buffer.config(text=f"采集: {buf}/{buf_max} 帧")
+                        self.progress_bar['value'] = min(buf / buf_max * 100, 100)
+                    elif t == 'summary':
+                        results = msg.get('seg_results', [])
+                        if results:
+                            scores = [r['score'] for r in results if r.get('score', 0) > 0]
+                            if scores:
+                                avg = sum(scores) / len(scores)
+                                p = sum(1 for r in results if r.get('qualified') == '合格')
+                                self.lbl_status.config(text=f"🏆 均分:{avg:.1f} | 通过:{p}/{len(results)}")
+                except Exception:
+                    pass  # widget 可能已被销毁
+        except queue.Empty:
+            pass
+        if self._running:
+            self.after(67, self._poll)
+
+    def _update_display(self, data: dict):
+        score = data.get('score', 0)
+        seg_id = data.get('segment_id', 0)
+        corr_text = data.get('correction_text', '')
+        joint_devs = data.get('joint_deviations', {})
+        score_str = f"{score:.1f}" if score > 0 else "--.-"
+
+        self.lbl_segment.config(text=f"段: {seg_id} / {max(self._ref_seg_count,1)}")
+        self.lbl_score.config(text=score_str)
+        if corr_text:
+            if corr_text.startswith(f"第{seg_id}段："):
+                corr_text = corr_text[len(f"第{seg_id}段："):]
+            self.lbl_correction.config(text=corr_text[:80])
+        else:
+            self.lbl_correction.config(text="跟练中...")
+        if joint_devs:
+            from dance_scoring.core.correction import JOINT_NAMES_CN
+            sd = sorted(joint_devs.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+            self.lbl_weak.config(text="  ".join(
+                f"{'🔴' if abs(d)>10 else '🟡'} {JOINT_NAMES_CN.get(j,f'关节{j}')}"
+                for j, d in sd if abs(d) > 5) or "-")
+
+    def _draw_canvas(self, canvas, frame, tag, data):
+        import cv2
+        from PIL import Image, ImageTk
+        try:
+            h, w = frame.shape[:2]
+            scale = min(self.CANVAS_W / w, self.CANVAS_H / h)
+            nw, nh = int(w * scale), int(h * scale)
+            if tag == 'user':
+                display = frame  # UsbCamera.read() 已返回 RGB
+            else:
+                display = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            display = cv2.resize(display, (nw, nh))
+            img = Image.fromarray(display)
+            photo = ImageTk.PhotoImage(img)
+            canvas.delete("all")
+            x, y = (self.CANVAS_W - nw) // 2, (self.CANVAS_H - nh) // 2
+            canvas.create_image(x, y, anchor=tk.NW, image=photo)
+            if tag == 'user':
+                self._tk_img_user = photo
+            else:
+                self._tk_img_ref = photo
+            label = "📷 我" if tag == 'user' else "📹 参考"
+            canvas.create_text(5, 5, anchor=tk.NW, text=label,
+                              fill="#eaeaea", font=("", 9, "bold"))
+            if tag == 'user' and self._last_result:
+                score = self._last_result.get('score', 0)
+                if score > 0:
+                    color = "#0f9b58" if score >= 60 else "#e94560"
+                    canvas.create_text(self.CANVAS_W // 2, 22,
+                                      text=f"{score:.1f}", fill=color,
+                                      font=("Helvetica", 24, "bold"))
+        except Exception:
+            pass  # cv2/PIL 处理失败时跳过该帧
+
+    def _show_placeholders(self):
+        for c in [self.canvas_user, self.canvas_ref]:
+            c.delete("all")
+            c.create_rectangle(0, 0, self.CANVAS_W, self.CANVAS_H,
+                              fill="black", outline=COLORS["bg_input"])
+            c.create_text(self.CANVAS_W // 2, self.CANVAS_H // 2,
+                         text="🎬" if c == self.canvas_user else "📹",
+                         fill=COLORS["text_muted"], font=("", 28))
+
+
+# ============================================================
+# 实时跟练弹窗
+# ============================================================
+
+class LiveApp(ttk.Toplevel):
+    def __init__(self, master, reference_path: str = ""):
+        super().__init__(master)
+        self.title("🎬 实时跟练 — 双画面")
+        self.geometry("860x620")
+        self.minsize(700, 500)
+        self._panel = LivePanel(self, reference_path)
+        self._panel.pack(fill=tk.BOTH, expand=True)
+        if reference_path:
+            self._panel.set_reference(reference_path)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+    def _on_close(self):
+        if hasattr(self, '_panel') and self._panel is not None:
+            self._panel._stop()
+        self.destroy()

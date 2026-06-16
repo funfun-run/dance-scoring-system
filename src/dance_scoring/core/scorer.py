@@ -9,13 +9,15 @@ from .config import (
     SCORE_PENALTY_LARGE, SCORE_PENALTY_THRESHOLD, DTW_WINDOW_RATIO, ANGLE_WEIGHTS, PASS_SCORE
 )
 from .dtw import dtw_constrained
+from .alignment import fastdtw_alignment
 from .segments import seg_by_beats
 
 
 class Scorer:
-    def __init__(self, cfg: Config, bpm=DEFAULT_BPM):
+    def __init__(self, cfg: Config, bpm=DEFAULT_BPM, alignment_method: str = "dtw"):
         self.cfg = cfg
         self.bpm = bpm
+        self.alignment_method = alignment_method
         self.spb = 60.0 / bpm
         self.sps = self.spb * BEATS_PER_SEGMENT
         self.frames_per_seg = int(self.sps * cfg.target_fps)
@@ -25,13 +27,19 @@ class Scorer:
         print(f"  参考:{nr}帧 用户:{nu}帧 BPM:{self.bpm}")
 
         if progress_callback: progress_callback(0, "DTW对齐...")
-        print("  [1/3] DTW对齐...")
+        print(f"  [1/3] 对齐 (方法: {self.alignment_method})...")
         ref_vec = np.array([p.vec for p in ref])
         user_vec = np.array([p.vec for p in user])
-        mat = cdist(ref_vec, user_vec, metric='euclidean')
-        window = max(int(max(nr, nu)*DTW_WINDOW_RATIO), 1)
-        path, cost = dtw_constrained(mat, window)
-        print(f"  对齐:{len(path)}对 窗口:{window}")
+
+        if self.alignment_method == "fastdtw":
+            radius = max(int(max(nr, nu) * DTW_WINDOW_RATIO), 1)
+            cost, path = fastdtw_alignment(ref_vec, user_vec, radius=radius)
+            print(f"  对齐:{len(path)}对 fastdtw radius:{radius}")
+        else:
+            mat = cdist(ref_vec, user_vec, metric='euclidean')
+            window = max(int(max(nr, nu) * DTW_WINDOW_RATIO), 1)
+            path, cost = dtw_constrained(mat, window)
+            print(f"  对齐:{len(path)}对 窗口:{window}")
 
         if progress_callback: progress_callback(0, "逐帧评分...")
         print("  [2/3] 逐帧评分...")

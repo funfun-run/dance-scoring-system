@@ -1,36 +1,39 @@
-# core/dtw.py — 约束窗口动态时间规整
+# core/alignment.py — 快速 DTW 对齐（基于 fastdtw）
 
 import numpy as np
+from scipy.spatial.distance import euclidean
+
+try:
+    from fastdtw import fastdtw as _fastdtw_impl
+    HAS_FASTDTW = True
+except ImportError:
+    HAS_FASTDTW = False
 
 
-def dtw_constrained(mat: np.ndarray, window: int):
+def fastdtw_alignment(seq1: np.ndarray, seq2: np.ndarray, radius: int = None):
     """
-    约束窗口 DTW。
-    mat: (n_ref, n_user) 距离矩阵
-    window: 搜索窗口大小
-    返回: (对齐路径 list[(ref_idx, user_idx)], 总代价)
+    使用 fastdtw 进行快速序列对齐（实时模式默认）。
+
+    参数:
+        seq1: (N, D) 参考序列
+        seq2: (M, D) 用户序列
+        radius: 搜索窗口半径，None 则自动设为 max(N,M)//10
+
+    返回:
+        (distance: float, path: list of (int, int))
+
+    与 dtw.py 的区别:
+        - dtw.py: Sakoe-Chiba 约束窗口 + 完整距离矩阵 → O(N*W)，精确
+        - alignment.py: fastdtw 近似算法 → O(N)，快速，适合实时场景
     """
-    nr, nu = mat.shape
-    cost = np.full((nr, nu), np.inf)
-    cost[0, 0] = mat[0, 0]
-    for i in range(1, nr):
-        cost[i, 0] = cost[i-1, 0] + mat[i, 0]
-    for j in range(1, nu):
-        cost[0, j] = cost[0, j-1] + mat[0, j]
-    for i in range(1, nr):
-        for j in range(max(1, i-window), min(nu, i+window+1)):
-            cost[i, j] = mat[i, j] + min(cost[i-1, j], cost[i, j-1], cost[i-1, j-1])
-    path = []
-    i, j = nr-1, nu-1
-    while i > 0 or j > 0:
-        path.append((i, j))
-        if i == 0:
-            j -= 1
-        elif j == 0:
-            i -= 1
-        else:
-            cand = {(i-1, j-1): cost[i-1, j-1], (i-1, j): cost[i-1, j], (i, j-1): cost[i, j-1]}
-            i, j = min(cand, key=cand.get)
-    path.append((0, 0))
-    path.reverse()
-    return path, cost[-1, -1]
+    if not HAS_FASTDTW:
+        raise ImportError(
+            "fastdtw 未安装，请执行: pip install fastdtw\n"
+            "或使用标准 DTW: from dance_scoring.core.dtw import dtw_constrained"
+        )
+
+    if radius is None:
+        radius = max(len(seq1), len(seq2)) // 10
+
+    distance, path = _fastdtw_impl(seq1, seq2, radius=radius, dist=euclidean)
+    return distance, path

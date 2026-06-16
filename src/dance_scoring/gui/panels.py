@@ -1,0 +1,764 @@
+# gui/panels.py — 功能面板 (评分 / 回顾 / 分割 / 设置 / NPU / 模型 / 性能)
+
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+import threading
+import os
+import json
+import subprocess
+import zipfile
+from pathlib import Path
+from typing import Optional, List, Dict
+
+from dance_scoring.gui.theme import COLORS, FONTS
+from dance_scoring.gui.components import VideoImporter, ScoreDisplay, SegmentBar
+
+
+# ============================================================
+# 评分面板
+# ============================================================
+
+class ScoringPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._ref_path: Optional[str] = None
+        self._user_path: Optional[str] = None
+        self._build()
+
+    def _build(self):
+        # 双视频导入
+        imp = ttk.Frame(self)
+        imp.pack(fill=tk.X, pady=(0, 8))
+        left = ttk.Frame(imp)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        self.ref_import = VideoImporter(left, "参考视频", on_select=lambda p: setattr(self, '_ref_path', p))
+        self.ref_import.pack(fill=tk.X)
+        right = ttk.Frame(imp)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        self.user_import = VideoImporter(right, "用户视频", on_select=lambda p: setattr(self, '_user_path', p))
+        self.user_import.pack(fill=tk.X)
+
+        # 参数
+        params = ttk.Frame(self)
+        params.pack(fill=tk.X, pady=4)
+        ttk.Label(params, text="BPM:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_bpm = tk.StringVar(value="120")
+        ttk.Entry(params, textvariable=self.var_bpm, width=6).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(params, text="合格线:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_threshold = tk.StringVar(value="60")
+        ttk.Entry(params, textvariable=self.var_threshold, width=6).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(params, text="算法:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_algo = tk.StringVar(value="dtw")
+        ttk.Combobox(params, textvariable=self.var_algo, values=["dtw", "fastdtw"],
+                    state="readonly", width=8).pack(side=tk.LEFT, padx=(2, 0))
+
+        # 开始按钮
+        self.btn_start = ttk.Button(self, text="▶  开始评分", command=self._do_score,
+                                     bootstyle="warning", style="warning.TButton")
+        self.btn_start.pack(fill=tk.X, pady=8)
+
+        # 进度
+        self.progress = ttk.Progressbar(self, mode='determinate', length=300)
+        self.lbl_progress = ttk.Label(self, text="", font=FONTS["small"],
+                                      foreground=COLORS["text_muted"])
+
+        # 结果区
+        self.result_frame = ttk.Frame(self)
+        self.score_display = ScoreDisplay(self.result_frame, "medium")
+
+        self.seg_list = ttk.Frame(self.result_frame)
+
+    def _do_score(self):
+        if getattr(self, '_scoring', False):
+            return
+        if not self._ref_path:
+            messagebox.showwarning("提示", "请先选择参考视频"); return
+        if not self._user_path:
+            messagebox.showwarning("提示", "请先选择用户视频"); return
+        try:
+            bpm = int(self.var_bpm.get())
+            threshold = float(self.var_threshold.get())
+        except ValueError:
+            messagebox.showwarning("提示", "BPM/阈值请输入数字"); return
+
+        self._scoring = True
+        self.progress.pack(fill=tk.X, pady=4)
+        self.lbl_progress.pack()
+        self.result_frame.pack_forget()
+        self.btn_start.config(state=tk.DISABLED)
+        self.progress['value'] = 0
+        self.lbl_progress.config(text="加载模型...")
+
+        def run():
+            try:
+                def _progress(pct, msg):
+                    try:
+                        self.master.after(0, lambda: self.progress.config(value=pct))
+                        self.master.after(0, lambda: self.lbl_progress.config(text=msg))
+                    except Exception:
+                        pass
+
+                _progress(10, "加载模型...")
+                from dance_scoring.core.extractor import PoseExtractor, download_model
+                from dance_scoring.core.scorer import Scorer
+                from dance_scoring.core.config import Config
+                download_model()
+                cfg = Config(score_threshold=threshold)
+
+                # 每个视频用独立的 PoseExtractor，确保 MediaPipe 时间戳从 0 开始
+                _progress(15, "提取参考视频姿态...")
+                ref = PoseExtractor(cfg).extract(self._ref_path)
+                _progress(45, "提取用户视频姿态...")
+                user = PoseExtractor(cfg).extract(self._user_path)
+
+                _progress(70, "DTW对齐+打分...")
+                scorer = Scorer(cfg, bpm=bpm, alignment_method=self.var_algo.get())
+                overall, segs, low, path = scorer.score(ref, user)
+
+                _progress(95, "保存结果...")
+                self._scoring = False
+
+                # 保存到 Hub（在主线程中）
+                def _done():
+                    try:
+                        if not self.winfo_exists():
+                            return
+                        self.progress.pack_forget()
+                        self.lbl_progress.pack_forget()
+                        self.btn_start.config(state=tk.NORMAL)
+                        self.lbl_progress.config(
+                            text=f"✅ 评分完成！总评 {overall:.1f}/100  "
+                                 f"{sum(1 for s in segs if s['score']>=threshold)}/"
+                                 f"{len(segs)}段合格",
+                            font=FONTS["body_bold"])
+                        self.lbl_progress.pack()
+                        # 存到 Hub
+                        for c in self.winfo_toplevel().winfo_children():
+                            if hasattr(c, 'set_score_result'):
+                                c.set_score_result(overall, segs, threshold,
+                                                  ref_path=self._ref_path or "",
+                                                  user_path=self._user_path or "")
+                                c.set_status(f"✅ 评分完成 {overall:.1f}分")
+                                break
+                    except Exception:
+                        pass
+
+                self.master.after(0, _done)
+            except Exception as e:
+                self._scoring = False
+                import traceback
+                err = f"{e}\n{traceback.format_exc()}"
+                print(err)
+                self.master.after(0, lambda: messagebox.showerror("评分失败", err[:300]))
+                self.master.after(0, lambda: self.btn_start.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _find_hub(self):
+        try:
+            root = self.winfo_toplevel()
+            for c in root.winfo_children():
+                if hasattr(c, 'last_score_result'):
+                    return c
+        except Exception:
+            pass
+        return None
+
+    def _go_review(self, segs, threshold):
+        pass  # 由 Hub 控制面板切换
+
+    def _reset(self):
+        self.result_frame.pack_forget()
+        for w in self.seg_list.winfo_children():
+            w.destroy()
+
+
+# ============================================================
+# 回顾面板
+# ============================================================
+
+class ReviewPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._hub = None
+        self._seg_widgets = []
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="📁 练习回顾", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 12))
+
+        # 内容区：左列表 + 右详情
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self.seg_list_frame = ttk.Frame(body, width=200)
+        self.seg_list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        self.seg_list_frame.pack_propagate(False)
+
+        self.detail_frame = ttk.Frame(body)
+        self.detail_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 默认空状态
+        self._show_empty()
+
+        # 尝试加载已有结果
+        self.after(200, self._try_load)
+
+    def _find_hub(self):
+        """向上查找 Hub 实例。"""
+        try:
+            root = self.winfo_toplevel()
+            for c in root.winfo_children():
+                if hasattr(c, 'last_score_result'):
+                    return c
+        except Exception:
+            pass
+        return None
+
+    def _try_load(self, retry=0):
+        self._hub = self._find_hub()
+        data = None
+        if self._hub is not None:
+            data = getattr(self._hub, 'last_score_result', None)
+        if data and data.get('segs'):
+            self._load_result(data)
+        elif retry < 5:
+            # Hub 还没准备好或数据还没写入，延迟重试
+            self.after(500, lambda: self._try_load(retry + 1))
+
+    def _load_result(self, data: dict):
+        """加载评分结果数据。"""
+        for w in self.seg_list_frame.winfo_children():
+            w.destroy()
+        for w in self.detail_frame.winfo_children():
+            w.destroy()
+
+        segs = data.get('segs', [])
+        threshold = data.get('threshold', 60)
+        overall = data.get('overall', 0)
+
+        # 标题
+        ttk.Label(self.seg_list_frame, text=f"总评 {overall:.1f}",
+                 font=FONTS["heading"], bootstyle="primary").pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(self.seg_list_frame,
+                 text=f"{sum(1 for s in segs if s['score']>=threshold)}/{len(segs)}段合格",
+                 font=FONTS["body"], foreground=COLORS["text_secondary"]
+                 ).pack(anchor=tk.W, pady=(0, 8))
+
+        # 段列表
+        for seg in segs:
+            passed = seg['score'] >= threshold
+            text = f"{'✅' if passed else '❌'} 段{seg['id']}  {seg['score']:.1f}"
+            fg = COLORS["success"] if passed else COLORS["danger"]
+            lbl = ttk.Label(self.seg_list_frame, text=text, font=FONTS["body"],
+                          foreground=fg, cursor="hand2")
+            lbl.pack(fill=tk.X, pady=2, anchor=tk.W)
+            lbl.bind("<Button-1>",
+                    lambda e, s=seg: self._show_seg_detail(s, threshold))
+            self._seg_widgets.append(lbl)
+
+        # 默认显示第一段
+        if segs:
+            self._show_seg_detail(segs[0], threshold)
+
+        # 底部按钮
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_frame, text="📂 练习视频目录",
+                  command=lambda: _open_output_dir("output/low_score_clips"),
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="📂 分段目录",
+                  command=lambda: _open_output_dir("output/segments"),
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="🔄 刷新",
+                  command=self._try_load,
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+
+    def _show_seg_detail(self, seg: dict, threshold: float):
+        """显示某段的详细信息：得分、时间、纠正建议、练习视频入口。"""
+        for w in self.detail_frame.winfo_children():
+            w.destroy()
+
+        passed = seg['score'] >= threshold
+        color = COLORS["success"] if passed else COLORS["danger"]
+        icon = "✅" if passed else "❌"
+
+        # 段标题
+        ttk.Label(self.detail_frame,
+                 text=f"{icon} 第 {seg['id']} 段",
+                 font=FONTS["heading"]).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Label(self.detail_frame,
+                 text=f"得分: {seg['score']:.1f}  |  "
+                      f"时间: {seg['start_time']:.1f}s - {seg['end_time']:.1f}s",
+                 font=FONTS["body"],
+                 foreground=color).pack(anchor=tk.W, pady=(0, 12))
+
+        # 纠正建议
+        ttk.Label(self.detail_frame, text="── 纠正建议 ──",
+                 font=FONTS["body_bold"]).pack(anchor=tk.W, pady=(0, 6))
+
+        corr_text = seg.get('correction_text', '')
+        if not corr_text:
+            # 从 Hub 数据生成纠正建议
+            hub_data = self._hub.last_score_result if self._hub else {}
+            corrections = hub_data.get('corrections', {})
+            corr_text = corrections.get(seg['id'], '')
+
+        if corr_text:
+            if corr_text.startswith(f"第{seg['id']}段："):
+                corr_text = corr_text[len(f"第{seg['id']}段："):]
+            for line in corr_text.split('；'):
+                line = line.strip()
+                if line:
+                    ttk.Label(self.detail_frame, text=f"⚡ {line}",
+                             font=FONTS["body"], wraplength=400,
+                             foreground=COLORS["warning"]).pack(anchor=tk.W, pady=2)
+        else:
+            ttk.Label(self.detail_frame, text="该段达标，无特别建议 ✨",
+                     font=FONTS["body"],
+                     foreground=COLORS["text_secondary"]).pack(anchor=tk.W)
+
+        # 练习视频
+        ttk.Separator(self.detail_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+        ttk.Label(self.detail_frame, text="── 练习视频 ──",
+                 font=FONTS["body_bold"]).pack(anchor=tk.W, pady=(0, 6))
+
+        clip_name = f"practice_seg{seg['id']:02d}_score{seg['score']:.0f}_slow.mp4"
+        clip_path = os.path.join(os.getcwd(), "output", "low_score_clips", clip_name)
+        seg_path = os.path.join(os.getcwd(), "output", "segments",
+                               f"ref_seg_{seg['id']:02d}_slow.mp4")
+
+        found_paths = []
+        if os.path.exists(clip_path):
+            found_paths.append(("低分练习视频 (慢动作 0.8x)", clip_path))
+        if os.path.exists(seg_path):
+            found_paths.append(("分段慢动作视频 (0.8x)", seg_path))
+
+        if found_paths:
+            for label, p in found_paths:
+                fsize = os.path.getsize(p) / 1024
+                frm = ttk.Frame(self.detail_frame)
+                frm.pack(fill=tk.X, anchor=tk.W, pady=2)
+                ttk.Label(frm, text=f"🎬 {label}",
+                         font=FONTS["body"]).pack(side=tk.LEFT)
+                ttk.Label(frm, text=f"({fsize:.0f}KB)",
+                         font=FONTS["small"],
+                         foreground=COLORS["text_muted"]).pack(side=tk.LEFT, padx=4)
+                ttk.Button(frm, text="▶",
+                          command=lambda p=p: _play_video(p),
+                          bootstyle="success-outline", width=3
+                          ).pack(side=tk.LEFT, padx=4)
+        else:
+            ttk.Label(self.detail_frame,
+                     text="💡 暂无练习视频\n不合格段的视频会在评分时自动生成",
+                     font=FONTS["small"],
+                     foreground=COLORS["text_muted"]).pack(anchor=tk.W)
+
+        ttk.Button(self.detail_frame, text="📂 打开目录",
+                  command=lambda: _open_output_dir("output/low_score_clips"),
+                  bootstyle="secondary-outline").pack(anchor=tk.W, pady=(4, 0))
+
+    def _show_empty(self):
+        ttk.Label(self.detail_frame, text="📁 练习回顾", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Label(self.detail_frame,
+                 text="请先完成一次评分\n\n"
+                      "评分后此处会显示：\n"
+                      "• 各段得分与纠正建议\n"
+                      "• 低分片段慢动作练习视频\n"
+                      "• 薄弱部位分析\n\n"
+                      "点击下方的「🔄 刷新」加载已有结果",
+                 font=FONTS["body"], foreground=COLORS["text_muted"],
+                 justify=tk.LEFT, wraplength=400).pack(pady=20)
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btn_row, text="📂 练习视频目录",
+                  command=lambda: _open_output_dir("output/low_score_clips"),
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="📂 分段目录",
+                  command=lambda: _open_output_dir("output/segments"),
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="🔄 加载评分结果",
+                  command=self._try_load,
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+
+
+# ============================================================
+# 分割面板
+# ============================================================
+
+class SplitPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        self.import_video = VideoImporter(self, "参考视频")
+        self.import_video.pack(fill=tk.X, pady=(0, 8))
+
+        params = ttk.Frame(self)
+        params.pack(fill=tk.X, pady=4)
+        ttk.Label(params, text="BPM:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_bpm = tk.StringVar(value="120")
+        ttk.Entry(params, textvariable=self.var_bpm, width=6).pack(side=tk.LEFT, padx=(2, 0))
+
+        self.btn_split = ttk.Button(self, text="✂️  开始分割", command=self._do_split,
+                                     bootstyle="warning")
+        self.btn_split.pack(fill=tk.X, pady=8)
+
+        self.result_frame = ttk.Frame(self)
+        self.lbl_result = ttk.Label(self.result_frame, text="", font=FONTS["body"],
+                                     foreground=COLORS["text_secondary"])
+
+    def _do_split(self):
+        if getattr(self, '_splitting', False):
+            return
+        path = self.import_video.get_file()
+        if not path:
+            messagebox.showwarning("提示", "请先选择参考视频"); return
+        try:
+            bpm = int(self.var_bpm.get())
+        except ValueError:
+            messagebox.showwarning("提示", "BPM 请输入整数"); return
+
+        self._splitting = True
+        self.btn_split.config(state=tk.DISABLED)
+        self.result_frame.pack(fill=tk.X, pady=8)
+        self.lbl_result.pack()
+        self.lbl_result.config(text="分割中...")
+
+        def run():
+            import sys
+            sys.path.insert(0, 'scripts')
+            try:
+                from split import split_video
+                segments = split_video(path, bpm)
+                n = len(segments)
+                self.master.after(0, lambda: self.lbl_result.config(
+                    text=f"分段数: {n}\n每段 ~4.0s (8拍)\n输出: output/segments/"))
+                self.master.after(0, lambda: ttk.Button(
+                    self.result_frame, text="📂 打开分段目录",
+                    command=lambda: _open_output_dir("output/segments"),
+                    bootstyle="secondary-outline").pack(pady=4))
+            except Exception as e:
+                self.master.after(0, lambda: messagebox.showerror("分割失败", str(e)))
+            finally:
+                self._splitting = False
+                self.master.after(0, lambda: self.btn_split.config(state=tk.NORMAL))
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ============================================================
+# 设置面板
+# ============================================================
+
+class SettingsPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="⚙️ 系统设置", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 12))
+
+        rows = [
+            ("推理后端", ["auto", "openvino", "mediapipe"], "auto"),
+            ("摄像头", ["/dev/video0", "/dev/video1"], "/dev/video0"),
+            ("对齐算法", ["dtw", "fastdtw"], "dtw"),
+            ("BPM 默认", None, "120"),
+            ("合格线", None, "60"),
+            ("采集窗口(帧)", None, "150"),
+        ]
+        self.vars = {}
+
+        for label, choices, default in rows:
+            f = ttk.Frame(self)
+            f.pack(fill=tk.X, pady=3)
+            ttk.Label(f, text=label, font=FONTS["body"], width=16,
+                     anchor=tk.W).pack(side=tk.LEFT)
+            if choices:
+                var = tk.StringVar(value=default)
+                ttk.Combobox(f, textvariable=var, values=choices,
+                            state="readonly", width=14).pack(side=tk.RIGHT)
+                self.vars[label] = var
+            else:
+                var = tk.StringVar(value=default)
+                ttk.Entry(f, textvariable=var, width=12).pack(side=tk.RIGHT)
+                self.vars[label] = var
+
+
+# ============================================================
+# NPU 面板
+# ============================================================
+
+class NPUPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="🖥️ NPU 状态", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 12))
+
+        self.info_frame = ttk.Frame(self)
+        self.info_frame.pack(fill=tk.BOTH, expand=True)
+        self._refresh()
+
+    def _refresh(self):
+        for w in self.info_frame.winfo_children():
+            w.destroy()
+
+        try:
+            from dance_scoring.platform.npu import NPUManager
+            import openvino as ov
+            core = ov.Core()
+            devices = core.available_devices
+            device = NPUManager.best_device()
+            cpu_info = core.get_property("CPU", "FULL_DEVICE_NAME")
+
+            info = [
+                ("设备", device),
+                ("CPU", cpu_info[:60]),
+                ("可用设备", ", ".join(devices)),
+                ("OpenVINO", ov.__version__),
+            ]
+
+            avail = NPUManager.available()
+            status = "✅ NPU 可用" if avail else "⚠️ NPU 不可用 (CPU 回退)"
+            status_color = COLORS["success"] if avail else COLORS["warning"]
+            ttk.Label(self.info_frame, text=status, font=FONTS["body_bold"],
+                     foreground=status_color).pack(anchor=tk.W, pady=(0, 6))
+
+            for k, v in info:
+                f = ttk.Frame(self.info_frame)
+                f.pack(fill=tk.X, pady=2)
+                ttk.Label(f, text=k, font=FONTS["body"], foreground=COLORS["text_muted"],
+                         width=12, anchor=tk.W).pack(side=tk.LEFT)
+                ttk.Label(f, text=v, font=FONTS["body"]).pack(side=tk.LEFT)
+
+            ttk.Button(self.info_frame, text="🔄 刷新", command=self._refresh,
+                      bootstyle="secondary-outline").pack(pady=(8, 0))
+
+        except Exception as e:
+            ttk.Label(self.info_frame, text=f"错误: {e}", font=FONTS["body"],
+                     foreground=COLORS["danger"]).pack()
+
+
+# ============================================================
+# 模型面板
+# ============================================================
+
+class ModelPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="🔧 模型管理", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 12))
+
+        self._show_status()
+        self._show_actions()
+
+    def _show_status(self):
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill=tk.X, pady=4)
+
+        ir_dir = Path("src/dance_scoring/models")
+        xml = ir_dir / "pose_landmarker.xml"
+        meta = ir_dir / "pose_landmarker_meta.json"
+
+        if xml.exists():
+            ttk.Label(status_frame, text="✅ IR 模型已转换", font=FONTS["body_bold"],
+                     foreground=COLORS["success"]).pack(anchor=tk.W)
+
+            if meta.exists():
+                with open(meta) as f:
+                    m = json.load(f)
+                ttk.Label(status_frame,
+                         text=f"精度: {m.get('precision','?')} │ "
+                              f"原始: {m.get('tflite_size_bytes',0)/1024:.0f}KB │ "
+                              f"IR: {m.get('ir_size_bytes',0)/1024:.0f}KB │ "
+                              f"压缩: {(1-m.get('compression_ratio',1))*100:.1f}%",
+                         font=FONTS["small"],
+                         foreground=COLORS["text_secondary"]).pack(anchor=tk.W, pady=(2, 0))
+        else:
+            ttk.Label(status_frame, text="⚠️ 未转换 IR 模型",
+                     font=FONTS["body_bold"],
+                     foreground=COLORS["warning"]).pack(anchor=tk.W)
+
+    def _show_actions(self):
+        actions = ttk.Frame(self)
+        actions.pack(fill=tk.X, pady=12)
+
+        ttk.Label(actions, text="精度:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_precision = tk.StringVar(value="FP16")
+        ttk.Combobox(actions, textvariable=self.var_precision,
+                    values=["FP16", "FP32", "INT8"],
+                    state="readonly", width=6).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(actions, text="🔄 重新转换", command=self._convert,
+                  bootstyle="secondary-outline").pack(side=tk.LEFT, padx=4)
+
+        self.lbl_conv_status = ttk.Label(self, text="", font=FONTS["small"])
+        self.lbl_conv_status.pack(anchor=tk.W)
+
+    def _convert(self):
+        if getattr(self, '_converting', False):
+            return
+        precision = self.var_precision.get()
+        self._converting = True
+        self.lbl_conv_status.config(text=f"转换中 ({precision})...", foreground=COLORS["warning"])
+
+        def run():
+            import subprocess, sys
+            try:
+                r = subprocess.run(
+                    [sys.executable, "scripts/convert_model.py",
+                     "--precision", precision],
+                    capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    self._converting = False
+                    self.master.after(0, lambda: self.lbl_conv_status.config(
+                        text="✅ 转换完成", foreground=COLORS["success"]))
+                    self.master.after(0, self._show_status)
+                else:
+                    self._converting = False
+                    self.master.after(0, lambda: self.lbl_conv_status.config(
+                        text=f"❌ 转换失败: {r.stderr[-120:]}",
+                        foreground=COLORS["danger"]))
+            except Exception as e:
+                self._converting = False
+                self.master.after(0, lambda: self.lbl_conv_status.config(
+                    text=f"❌ {e}", foreground=COLORS["danger"]))
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ============================================================
+# 性能面板
+# ============================================================
+
+class PerfPanel(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="📈 性能测试", font=FONTS["heading"],
+                 foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 12))
+
+        # 测试视频选择
+        f1 = ttk.Frame(self)
+        f1.pack(fill=tk.X, pady=4)
+        ttk.Label(f1, text="测试视频:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.lbl_video = ttk.Label(f1, text="(使用随机帧)", font=FONTS["small"],
+                                   foreground=COLORS["text_muted"])
+        self.lbl_video.pack(side=tk.LEFT, padx=4)
+        ttk.Button(f1, text="选择", command=self._sel_video,
+                  bootstyle="secondary-outline").pack(side=tk.RIGHT)
+
+        # 参数
+        f2 = ttk.Frame(self)
+        f2.pack(fill=tk.X, pady=4)
+        ttk.Label(f2, text="帧数:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_frames = tk.StringVar(value="100")
+        ttk.Entry(f2, textvariable=self.var_frames, width=6).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(f2, text="预热:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_warmup = tk.StringVar(value="2")
+        ttk.Entry(f2, textvariable=self.var_warmup, width=4).pack(side=tk.LEFT, padx=(2, 0))
+
+        ttk.Button(self, text="▶  开始测试", command=self._run_test,
+                  bootstyle="warning").pack(fill=tk.X, pady=8)
+
+        self.result_text = tk.Text(self, height=10, bg=COLORS["input_bg"],
+                                   fg=COLORS["text"], font=FONTS["mono"],
+                                   relief=tk.FLAT, borderwidth=4,
+                                   insertbackground=COLORS["text"])
+        self.result_text.pack(fill=tk.BOTH, expand=True)
+
+        self._video_path: Optional[str] = None
+
+    def _sel_video(self):
+        path = filedialog.askopenfilename(
+            title="选择测试视频",
+            filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv"), ("所有文件", "*.*")])
+        if path:
+            self._video_path = path
+            self.lbl_video.config(text=os.path.basename(path)[:30])
+
+    def _run_test(self):
+        if getattr(self, '_testing', False):
+            return
+        try:
+            frames = int(self.var_frames.get())
+            warmup = int(self.var_warmup.get())
+        except ValueError:
+            messagebox.showwarning("提示", "帧数/预热请输入整数"); return
+
+        self._testing = True
+        self.result_text.delete("1.0", tk.END)
+        self.result_text.insert(tk.END, "测试中...\n")
+
+        def run():
+            import subprocess, sys
+            cmd = [sys.executable, "scripts/benchmark.py",
+                   "--frames", str(frames), "--rounds", str(warmup)]
+            if self._video_path:
+                cmd.append(self._video_path)
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                output = r.stdout if r.returncode == 0 else r.stderr
+                self.master.after(0, lambda: self.result_text.delete("1.0", tk.END))
+                self.master.after(0, lambda: self.result_text.insert(tk.END, output[-3000:]))
+            except Exception as e:
+                self.master.after(0, lambda: self.result_text.insert(tk.END, f"错误: {e}"))
+            finally:
+                self._testing = False
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ============================================================
+# 工具
+# ============================================================
+
+def _open_output_dir(path: str):
+    """打开输出目录。"""
+    try:
+        full = os.path.join(os.getcwd(), path)
+        os.makedirs(full, exist_ok=True)
+        if os.name == 'nt':
+            os.startfile(full)
+        else:
+            subprocess.Popen(['xdg-open', full])
+    except Exception as e:
+        messagebox.showwarning("提示", f"无法打开目录: {e}")
+
+
+def _play_video(path: str):
+    """用系统播放器打开视频文件。"""
+    if not os.path.exists(path):
+        messagebox.showinfo("提示", f"文件不存在:\n{os.path.basename(path)}")
+        return
+    # 依次尝试常见播放器
+    for player in ['vlc', 'mpv', 'ffplay', 'totem', 'xdg-open']:
+        try:
+            r = subprocess.run(['which', player], capture_output=True, text=True)
+            if r.returncode == 0:
+                subprocess.Popen([player, path],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+                return
+        except Exception:
+            continue
+    # 最后兜底：xdg-open 打开包含文件的目录
+    try:
+        subprocess.Popen(['xdg-open', os.path.dirname(path)])
+    except Exception as e:
+        messagebox.showwarning("提示", f"无法播放视频: {e}")
