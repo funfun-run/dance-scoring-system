@@ -616,15 +616,40 @@ class LivePanel(ttk.Frame):
                                     wraplength=420)
         self._sum_corr.pack(anchor=tk.W, pady=(0, 16))
 
-        # 继续按钮
+        # 操作按钮
         btn_row = ttk.Frame(inner)
         btn_row.pack(fill=tk.X)
-        self.btn_continue = ttk.Button(btn_row, text="🔄  继续下一轮练习",
-                                       command=self._resume_practice,
-                                       bootstyle="success", style="success.TButton")
-        self.btn_continue.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(btn_row, text="⏹  停止练习", command=self._stop,
+        self.btn_restart = ttk.Button(btn_row, text="🔄  重新跟练",
+                                      command=self._restart_practice,
+                                      bootstyle="success", style="success.TButton")
+        self.btn_restart.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🚪  退出跟练", command=self._exit_practice,
                    bootstyle="danger-outline").pack(side=tk.LEFT)
+
+    def _restart_practice(self):
+        """重新跟练：停止当前 worker，清空结果，从头开始。"""
+        # 停止当前 worker
+        if self._worker:
+            self._worker.cancel()
+            self._worker = None
+        # 恢复左右画面
+        self._hide_summary()
+        # 清空状态
+        self._last_result = None
+        self._ref_seg_count = 0
+        self._show_placeholders()
+        # 重新开始
+        self._start()
+
+    def _exit_practice(self):
+        """退出跟练：停止 worker，回到导入界面。"""
+        if self._worker:
+            self._worker.cancel()
+            self._worker = None
+        self._running = False
+        self._hide_summary()
+        self._show_placeholders()
+        self._show_import()
 
     def _show_summary(self, data: dict):
         """显示轮次摘要，隐藏左右画面。"""
@@ -702,12 +727,6 @@ class LivePanel(ttk.Frame):
         self._left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         self.lbl_status.config(text="新一轮练习开始...", bootstyle="info")
-
-    def _resume_practice(self):
-        """用户点击继续 → 恢复左右画面 → 通知 worker 继续。"""
-        self._hide_summary()
-        if self._worker and self._worker.is_alive():
-            self._worker.resume()
 
     # ── 模式切换 ──
 
