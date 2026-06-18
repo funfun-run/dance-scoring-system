@@ -19,12 +19,21 @@ if __name__ == "__main__":
     parser.add_argument('-b', '--bpm', type=int, default=DEFAULT_BPM, help='BPM（需与视频分割工具一致）')
     parser.add_argument('-t', '--threshold', type=float, default=50.0)
     parser.add_argument('-s', '--segments', default='output/segments', help='视频分段输出目录')
+    parser.add_argument('--correction', default='rule', choices=['rule', 'llm'],
+                        help='纠正后端: rule (规则引擎) / llm (本地LLM模型)')
+    parser.add_argument('--model', default='1.5b', choices=['1.5b', '3b'],
+                        help='LLM 模型选择: 1.5b (快速) / 3b (精准)')
     args = parser.parse_args()
 
     for p, n in [(args.reference, "参考"), (args.user, "用户")]:
         if not os.path.exists(p):
             print(f"❌ {n}视频不存在: {p}")
             sys.exit(1)
+
+    # 创建纠正提供者
+    from dance_scoring.core.correction_provider import create_correction_provider
+    corr = create_correction_provider(args.correction, model=args.model)
+    print(f"  纠正后端: {corr.provider_name}")
 
     print("\n" + "=" * 60)
     print("   🕺 舞蹈评分 v1.0 | 统一分段逻辑")
@@ -42,7 +51,7 @@ if __name__ == "__main__":
     user = PoseExtractor(cfg).extract(args.user)
     print("\n[3/3] 评分...")
     scorer = Scorer(cfg, bpm=args.bpm)
-    overall, segs, low, path = scorer.score(ref, user)
+    overall, segs, low, path = scorer.score(ref, user, correction_provider=corr)
 
     fail_segs = [s for s in segs if s['score'] < PASS_SCORE]
 

@@ -19,6 +19,7 @@ from typing import Optional, List, Dict
 import numpy as np
 import cv2
 
+from dance_scoring.gui.logger import log, guard
 from dance_scoring.gui.theme import COLORS, FONTS
 
 VIDEO_FILTERS = [("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
@@ -88,63 +89,79 @@ class LiveWorker(threading.Thread):
         self._paused.set()
 
     def run(self):
-        try:
-            self._setup()
-            self._loop()
-        except Exception as e:
-            import traceback
-            self.queue.put({'type': 'error',
-                           'message': f"{e}\n{traceback.format_exc()}"})
-        finally:
-            self._cleanup()
+        with guard("LiveWorker.run"):
+            try:
+                self._setup()
+                self._loop()
+            except Exception as e:
+                import traceback
+                log.error(f"LiveWorker 异常: {traceback.format_exc()}")
+                self.queue.put({'type': 'error',
+                               'message': f"{e}\n{traceback.format_exc()}"})
+            finally:
+                self._cleanup()
 
     # ======== 初始化 ========
 
     def _setup(self):
-        # 摄像头
-        from dance_scoring.camera.usb import UsbCamera
-        self.camera = UsbCamera(device_id=self.camera_id)
-        if not self.camera.open():
-            self.queue.put({'type': 'error',
-                           'message': f'无法打开摄像头 (device_id={self.camera_id})'})
-            raise RuntimeError('摄像头打开失败')
+        with guard("LiveWorker._setup"):
+            # 摄像头
+            log.info("打开摄像头...")
+            from dance_scoring.camera.usb import UsbCamera
+            self.camera = UsbCamera(device_id=self.camera_id)
+            if not self.camera.open():
+                log.error(f"摄像头打开失败 (device_id={self.camera_id})")
+                self.queue.put({'type': 'error',
+                               'message': f'无法打开摄像头 (device_id={self.camera_id})'})
+                raise RuntimeError('摄像头打开失败')
 
-        self.queue.put({'type': 'status', 'message': '📷 摄像头已打开'})
+            self.queue.put({'type': 'status', 'message': '📷 摄像头已打开'})
+            log.info("摄像头就绪")
 
-        # 姿态提取器
-        from dance_scoring.core.extractor import PoseExtractor, download_model
-        from dance_scoring.core.config import Config
-        download_model()
-        self.extractor = PoseExtractor(Config())
-        self.queue.put({'type': 'status', 'message': '📐 姿态模型已加载'})
+            # 姿态提取器
+            log.info("下载/加载 MediaPipe 模型...")
+            from dance_scoring.core.extractor import PoseExtractor, download_model
+            from dance_scoring.core.config import Config
+            download_model()
+            self.extractor = PoseExtractor(Config())
+            self.queue.put({'type': 'status', 'message': '📐 姿态模型已加载'})
+            log.info("MediaPipe 模型就绪")
 
-        # 参考视频 → 预提取姿态序列 (用于打分), 原始帧按需加载 (用于显示)
-        self.queue.put({'type': 'status',
-                        'message': f'📹 加载参考视频...'})
+            # 参考视频 → 预提取姿态序列
+            self.queue.put({'type': 'status', 'message': '📹 提取参考视频姿态...'})
+            log.info(f"提取参考姿态: {self.ref_path}")
+            self.ref_poses = self.extractor.extract(self.ref_path)
+            nref = len(self.ref_poses)
+            log.info(f"参考姿态: {nref} 帧")
 
-        self.ref_poses = self.extractor.extract(self.ref_path)
-        nref = len(self.ref_poses)
+            # 按八拍分段
+            from dance_scoring.core.config import BEATS_PER_SEGMENT, TARGET_FPS
+            spb = 60.0 / self.bpm
+            sps = spb * BEATS_PER_SEGMENT
+            fps = max(1, int(sps * TARGET_FPS))
 
-        # 按八拍分段，只存每个段的帧索引范围
-        from dance_scoring.core.config import BEATS_PER_SEGMENT, TARGET_FPS
-        spb = 60.0 / self.bpm
-        sps = spb * BEATS_PER_SEGMENT
-        fps = max(1, int(sps * TARGET_FPS))
-
-        # 一次性读取全部原始帧到内存，避免 cv2.CAP_PROP_POS_FRAMES
-        # 在非零位置 seek 不准确的问题（H.264 关键帧限制）
-        self.queue.put({'type': 'status',
-                        'message': '📹 缓存参考视频帧...'})
-        cap = cv2.VideoCapture(self.ref_path)
-        self._all_raw_frames: list = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            self._all_raw_frames.append(frame)
-        cap.release()
-        raw_total = max(len(self._all_raw_frames), 1)
-        ratio = raw_total / max(nref, 1)
+            # 缓存参考视频原始帧（在姿态提取之后做，避免同时打开两个 VideoCapture）
+            self.queue.put({'type': 'status', 'message': '📹 缓存参考视频帧...'})
+            log.info(f"缓存参考视频帧...")
+            self._all_raw_frames: list = []
+            try:
+                cap = cv2.VideoCapture(self.ref_path)
+                if not cap.isOpened():
+                    raise RuntimeError(f"无法打开参考视频")
+                frame_idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    self._all_raw_frames.append(frame)
+                    frame_idx += 1
+                cap.release()
+                log.info(f"参考视频帧缓存完成: {frame_idx} 帧")
+            except Exception as e:
+                log.warning(f"缓存参考帧失败（不影响跟练）: {e}")
+                self._all_raw_frames = []
+            raw_total = max(len(self._all_raw_frames), 1)
+            ratio = raw_total / max(nref, 1)
 
         self.ref_segs = []
         for sid in range(max(1, (nref + fps - 1) // fps)):
@@ -177,25 +194,52 @@ class LiveWorker(threading.Thread):
         self.frame_counter = 0
         self._seg_frame_no = 0  # 当前段内帧计数 (不受窗口切片影响)
 
+        # 预导入 C++ 扩展（避免 _loop 延迟导入时与摄像头线程冲突导致段错误）
+        from dance_scoring.core.scorer import Scorer
+        from dance_scoring.core.config import Config, Z_AXIS_WEIGHT
+        from dance_scoring.core.frame import PoseFrame
+        import mediapipe as mp
+        self._Scorer = Scorer
+        self._Config = Config
+        self._PoseFrame = PoseFrame
+        self._mp = mp
+        self._Z_AXIS_WEIGHT = Z_AXIS_WEIGHT
+
     # ======== 主循环 ========
 
     def _loop(self):
-        import mediapipe as mp
-        from dance_scoring.core.frame import PoseFrame
-        from dance_scoring.core.scorer import Scorer
-        from dance_scoring.core.config import Config, Z_AXIS_WEIGHT
+        log.info("进入实时跟练主循环")
+        try:
+            self._loop_impl()
+        except Exception as e:
+            import traceback
+            log.error(f"LiveWorker._loop 异常: {traceback.format_exc()}")
+            self.queue.put({'type': 'error', 'message': str(e)})
 
-        scorer_cfg = Config()
-        scorer = Scorer(scorer_cfg, bpm=self.bpm, alignment_method=self.alignment)
-
-        # 发送第一段开始信号
+    def _loop_impl(self):
+        """实际主循环逻辑。"""
+        scorer_cfg = self._Config()
+        scorer = self._Scorer(scorer_cfg, bpm=self.bpm, alignment_method=self.alignment)
         self._send_segment_start()
+
+        # 摄像头预热（避免首帧段错误）
+        for _ in range(10):
+            if self._cancel.is_set():
+                return
+            try:
+                f = self.camera.read()
+                if f is not None and hasattr(f, 'shape') and f.shape[0] > 0:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
 
         while not self._cancel.is_set():
             try:
                 user_frame = self.camera.read()
             except Exception:
-                break
+                time.sleep(0.5)
+                continue
             if user_frame is None:
                 if self._cancel.is_set():
                     break
@@ -360,9 +404,41 @@ class LiveWorker(threading.Thread):
                             'qualified': r['qualified']}
                            for r in self.seg_results],
         }
+
+        # 先发摘要（GUI 立即展示），再发 AI 请求（主线程队列顺序执行）
         self.queue.put(summary)
+        self._request_ai_plan(summary, weakest, all_corrections)
+
         print(f"[跟练] 本轮完成: 均分{avg_score:.1f}, {qualified}/{total}合格, "
               f"薄弱部位: {[w[2] for w in weakest[:3]]}")
+
+    def _request_ai_plan(self, summary: dict, weakest: list, corrections: list):
+        """通过队列将 AI 请求交给主线程执行（避免 LiveWorker 线程中的 OpenVINO/MediaPipe 冲突）。"""
+        log.info("请求 AI 训练计划（主线程模式）...")
+        self.queue.put({'type': 'status', 'message': '🤖 AI 正在生成训练计划...'})
+
+        ctx_lines = [
+            "你是真人舞蹈教练，刚看完学员的一轮跟练。根据数据给训练建议：",
+            f"均分{summary['avg_score']:.0f}分，{summary['qualified']}/{summary['total']}段通过。",
+        ]
+        if weakest:
+            parts = ["薄弱部位:"]
+            for j, d, name in weakest[:3]:
+                parts.append(f"{name}")
+            ctx_lines.append(" ".join(parts))
+        ctx_lines += [
+            "要求：先一句话鼓励，再给2-3条具体练习建议。像聊天一样自然，不超过100字。",
+        ]
+
+        system_ctx = "\n".join(ctx_lines)
+        user_msg = "请根据以上数据生成训练计划。"
+
+        # 通过队列发送给主线程（主线程加载模型不会和 MediaPipe 冲突）
+        self.queue.put({
+            'type': '_do_ai_plan',
+            'system_ctx': system_ctx,
+            'user_msg': user_msg,
+        })
 
     def _score_window(self, scorer):
         from dance_scoring.core.config import ANGLE_JOINTS
@@ -576,15 +652,73 @@ class LivePanel(ttk.Frame):
         self.lbl_status.pack(side=tk.RIGHT, padx=4)
         self._show_placeholders()
 
+    def _do_ai_plan(self, system_ctx: str, user_msg: str):
+        """生成训练计划。只用 3B（1.5B 对长 prompt 太慢，模型导出时未开 KV-cache）。"""
+        q = self._queue
+
+        def _call():
+            try:
+                from LLM.model_manager import load_model, chat_safe, get_current_model_key
+                # 3B 有 KV-cache，长 prompt 也快
+                if get_current_model_key() != "3b":
+                    load_model("3b")
+                plan = chat_safe(system_ctx, [], user_msg, max_wait=120)
+                if not plan or plan.startswith('抱歉'):
+                    plan = '未生成有效计划，请重试。'
+                q.put({'type': 'ai_plan', 'plan': plan})
+                log.info(f"AI 训练计划完成 ({len(plan)} 字)")
+            except Exception as e:
+                q.put({'type': 'ai_plan', 'plan': f'⚠️ AI 异常: {e}'})
+        threading.Thread(target=_call, daemon=True).start()
+
     # ── 轮次摘要面板 ──
 
     def _build_summary_panel(self):
-        """构建轮次完成后的摘要面板（覆盖右侧信息区）。"""
+        """构建轮次完成后的摘要面板（覆盖右侧信息区，带滚动条）。"""
         self._summary_frame = ttk.Frame(self._main)
-        # 默认隐藏
 
-        inner = ttk.Frame(self._summary_frame, padding=16)
-        inner.pack(fill=tk.BOTH, expand=True)
+        # Canvas + 滚动条
+        self._sum_canvas = tk.Canvas(self._summary_frame, bg=COLORS["bg"],
+                                      highlightthickness=0)
+        sum_scrollbar = ttk.Scrollbar(self._summary_frame, orient=tk.VERTICAL,
+                                       command=self._sum_canvas.yview)
+        self._sum_canvas.configure(yscrollcommand=sum_scrollbar.set)
+
+        self._sum_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sum_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 内容 frame 放在 canvas 内部
+        self._sum_inner = ttk.Frame(self._sum_canvas, padding=16)
+        self._sum_window = self._sum_canvas.create_window(
+            (0, 0), window=self._sum_inner, anchor=tk.NW)
+
+        # 让 canvas 宽度跟随 inner frame
+        def _on_configure(event):
+            self._sum_canvas.itemconfig(self._sum_window, width=event.width)
+        self._sum_canvas.bind("<Configure>", _on_configure)
+
+        def _on_inner_configure(event):
+            self._sum_canvas.configure(scrollregion=self._sum_canvas.bbox("all"))
+        self._sum_inner.bind("<Configure>", _on_inner_configure)
+
+        # 鼠标滚轮滚动 — 局部绑定，不影响全局
+        def _on_mousewheel(event):
+            if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+                self._sum_canvas.yview_scroll(-1, "units")
+            elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+                self._sum_canvas.yview_scroll(1, "units")
+        # Linux: Button-4/Button-5 on the canvas itself
+        self._sum_canvas.bind("<Button-4>", _on_mousewheel)
+        self._sum_canvas.bind("<Button-5>", _on_mousewheel)
+        # 将 canvas 的滚动绑定传播给 inner frame 的每个子 widget
+        def _bind_scroll(w):
+            w.bind("<Button-4>", _on_mousewheel)
+            w.bind("<Button-5>", _on_mousewheel)
+            for child in w.winfo_children():
+                _bind_scroll(child)
+        self._sum_inner.bind("<Map>", lambda e: _bind_scroll(self._sum_inner))
+
+        inner = self._sum_inner
 
         # 标题
         self._sum_title = ttk.Label(inner, text="", font=FONTS["heading"])
@@ -614,7 +748,16 @@ class LivePanel(ttk.Frame):
                  ).pack(anchor=tk.W, pady=(0, 4))
         self._sum_corr = ttk.Label(inner, text="", font=FONTS["body"],
                                     wraplength=420)
-        self._sum_corr.pack(anchor=tk.W, pady=(0, 16))
+        self._sum_corr.pack(anchor=tk.W, pady=(0, 12))
+
+        # AI 训练计划
+        ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(4, 8))
+        ttk.Label(inner, text="🤖 AI 训练计划", font=FONTS["body_bold"],
+                 foreground=COLORS["accent"]).pack(anchor=tk.W, pady=(0, 4))
+        self._sum_ai_plan = tk.Label(inner, text="", font=FONTS["body"],
+                                      fg="#000000", bg="#0F172A",
+                                      wraplength=420, justify=tk.LEFT)
+        self._sum_ai_plan.pack(anchor=tk.W, pady=(0, 16))
 
         # 操作按钮
         btn_row = ttk.Frame(inner)
@@ -628,17 +771,13 @@ class LivePanel(ttk.Frame):
 
     def _restart_practice(self):
         """重新跟练：停止当前 worker，清空结果，从头开始。"""
-        # 停止当前 worker
         if self._worker:
             self._worker.cancel()
             self._worker = None
-        # 恢复左右画面
         self._hide_summary()
-        # 清空状态
         self._last_result = None
         self._ref_seg_count = 0
         self._show_placeholders()
-        # 重新开始
         self._start()
 
     def _exit_practice(self):
@@ -653,7 +792,6 @@ class LivePanel(ttk.Frame):
 
     def _show_summary(self, data: dict):
         """显示轮次摘要，隐藏左右画面。"""
-        # 隐藏左右
         self._left.pack_forget()
         self._right.pack_forget()
         # 显示摘要
@@ -716,6 +854,11 @@ class LivePanel(ttk.Frame):
         else:
             self._sum_corr.config(text="全部段表现良好，继续保持！")
 
+        # AI 训练计划（初始：生成中）
+        self._sum_ai_plan.config(
+            text="⏳ AI 正在根据本轮数据生成训练计划...",
+            fg="#666666")
+
         # 更新状态栏
         self.lbl_status.config(
             text=f"🏆 本轮均分 {avg:.1f} · 点击继续开始下一轮",
@@ -724,6 +867,11 @@ class LivePanel(ttk.Frame):
     def _hide_summary(self):
         """隐藏摘要，恢复左右画面。"""
         self._summary_frame.pack_forget()
+        # 重置 canvas 滚动位置
+        try:
+            self._sum_canvas.yview_moveto(0)
+        except Exception:
+            pass
         self._left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._right.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         self.lbl_status.config(text="新一轮练习开始...", bootstyle="info")
@@ -769,42 +917,61 @@ class LivePanel(ttk.Frame):
     # ---------- 控制 ----------
 
     def _start(self):
-        if not self._ref_path or not os.path.exists(self._ref_path):
-            messagebox.showwarning("提示", "请先选择参考视频")
-            return
-        if self._worker is not None and self._worker.is_alive():
-            return
-        self._running = True
-        self._last_result = None
-        self.btn_start.config(state=tk.DISABLED)
-        self.lbl_status.config(text="初始化中...", bootstyle="info")
+        with guard("开始跟练"):
+            if not self._ref_path or not os.path.exists(self._ref_path):
+                messagebox.showwarning("提示", "请先选择参考视频")
+                return
+            if self._worker is not None and self._worker.is_alive():
+                return
+            log.info(f"启动跟练: ref={self._ref_path}")
+            self._running = True
+            self._last_result = None
+            self.btn_start.config(state=tk.DISABLED)
+
+            # 跟练 AI 训练计划固定用 3B（1.5B 长 prompt 太慢）
+            self.lbl_status.config(text="⏳ 加载 AI 模型...", bootstyle="info")
+            # 必须在启动 MediaPipe 前加载 LLM
+            def _preload_then_start():
+                try:
+                    from LLM.model_manager import load_model
+                    load_model("3b")
+                except Exception as e:
+                    log.warning(f"模型预加载失败: {e}")
+                self.master.after(0, self._do_start)
+            threading.Thread(target=_preload_then_start, daemon=True).start()
+
+    def _do_start(self):
+        """LLM 加载完成后在主线程启动 LiveWorker。"""
+        self.lbl_status.config(text="初始化摄像头...", bootstyle="info")
+        self.update_idletasks()
         self._queue = queue.Queue()
         self._worker = LiveWorker(self._ref_path, self._queue, camera_id=0)
         self._worker.start()
         self.after(100, self._poll)
 
     def _stop(self):
-        self._running = False
-        if self._worker:
-            self._worker.cancel()
-            self._worker = None
-        try:
-            self.btn_start.config(state=tk.NORMAL)
-        except Exception:
-            pass
-        try:
-            self.lbl_status.config(text="已停止", bootstyle="secondary")
-        except Exception:
-            pass
-        try:
-            self._show_placeholders()
-        except Exception:
-            pass
-        # 恢复到练习界面（如果摘要面板正在显示）
-        try:
-            self._hide_summary()
-        except Exception:
-            pass
+        with guard("停止跟练"):
+            log.info("停止跟练")
+            self._running = False
+            if self._worker:
+                self._worker.cancel()
+                self._worker = None
+            try:
+                self.btn_start.config(state=tk.NORMAL)
+            except Exception:
+                pass
+            try:
+                self.lbl_status.config(text="已停止", bootstyle="secondary")
+            except Exception:
+                pass
+            try:
+                self._show_placeholders()
+            except Exception:
+                pass
+            try:
+                self._hide_summary()
+            except Exception:
+                pass
 
     # ---------- 轮询队列 ----------
 
@@ -852,12 +1019,24 @@ class LivePanel(ttk.Frame):
                                 p = sum(1 for r in results if r.get('qualified') == '合格')
                                 self.lbl_status.config(text=f"🏆 均分:{avg:.1f} | 通过:{p}/{len(results)}")
                     elif t == 'cycle_complete':
-                        # 新的轮次完成消息：显示详细摘要面板
                         self._show_summary(msg)
+                    elif t == 'ai_plan':
+                        try:
+                            self._sum_ai_plan.config(
+                                text=msg.get('plan', ''),
+                                fg="#000000")
+                            self.lbl_status.config(text="✅ 训练计划已生成", bootstyle="success")
+                        except Exception:
+                            pass
+                    elif t == '_do_ai_plan':
+                        # 主线程处理 AI 请求（避免 LiveWorker 线程中 OpenVINO/MediaPipe 冲突）
+                        self._do_ai_plan(msg.get('system_ctx', ''),
+                                        msg.get('user_msg', ''))
                 except Exception:
                     pass  # widget 可能已被销毁
         except queue.Empty:
             pass
+
         if self._running:
             self.after(67, self._poll)
 
@@ -935,8 +1114,8 @@ class LiveApp(ttk.Toplevel):
     def __init__(self, master, reference_path: str = ""):
         super().__init__(master)
         self.title("🎬 实时跟练 — 双画面")
-        self.geometry("860x620")
-        self.minsize(700, 500)
+        self.geometry("860x700")
+        self.minsize(700, 560)
         self._panel = LivePanel(self, reference_path)
         self._panel.pack(fill=tk.BOTH, expand=True)
         if reference_path:

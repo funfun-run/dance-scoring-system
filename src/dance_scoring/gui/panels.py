@@ -13,7 +13,20 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 from dance_scoring.gui.theme import COLORS, FONTS
+from dance_scoring.gui.logger import log, guard, safe_after, safe_thread
 from dance_scoring.gui.components import VideoImporter, ScoreDisplay, SegmentBar
+
+
+def _check_llm_available() -> bool:
+    """检查 LLMProvider 子类是否可用（仅检查文件存在，不加载模型）。"""
+    try:
+        project_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        )
+        my_qwen = os.path.join(project_root, "LLM", "my_qwen.py")
+        return os.path.exists(my_qwen)
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -52,7 +65,18 @@ class ScoringPanel(ttk.Frame):
         ttk.Label(params, text="算法:", font=FONTS["body"]).pack(side=tk.LEFT)
         self.var_algo = tk.StringVar(value="dtw")
         ttk.Combobox(params, textvariable=self.var_algo, values=["dtw", "fastdtw"],
-                    state="readonly", width=8).pack(side=tk.LEFT, padx=(2, 0))
+                    state="readonly", width=8).pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(params, text="纠正:", font=FONTS["body"]).pack(side=tk.LEFT)
+        self.var_correction = tk.StringVar(value="rule")
+        # 检查 LLM 是否可用
+        llm_available = _check_llm_available()
+        corr_values = ["rule", "llm"] if llm_available else ["rule"]
+        corr_state = "readonly" if llm_available else tk.DISABLED
+        self.cmb_correction = ttk.Combobox(
+            params, textvariable=self.var_correction, values=corr_values,
+            state=corr_state, width=6)
+        self.cmb_correction.pack(side=tk.LEFT, padx=(2, 0))
 
         # 开始按钮
         self.btn_start = ttk.Button(self, text="▶  开始评分", command=self._do_score,
@@ -83,6 +107,12 @@ class ScoringPanel(ttk.Frame):
         except ValueError:
             messagebox.showwarning("提示", "BPM/阈值请输入数字"); return
 
+        # ⚠️ 必须在主线程读取 Tkinter 变量
+        ref_path = self._ref_path
+        user_path = self._user_path
+        algo = self.var_algo.get()
+        correction_backend = self.var_correction.get()
+
         self._scoring = True
         self.progress.pack(fill=tk.X, pady=4)
         self.lbl_progress.pack()
@@ -91,8 +121,11 @@ class ScoringPanel(ttk.Frame):
         self.progress['value'] = 0
         self.lbl_progress.config(text="加载模型...")
 
+        log.info(f"开始评分: ref={os.path.basename(ref_path)} user={os.path.basename(user_path)} "
+                 f"algo={algo} correction={correction_backend}")
+
         def run():
-            try:
+            with guard("评分流水线"):
                 def _progress(pct, msg):
                     try:
                         self.master.after(0, lambda: self.progress.config(value=pct))
@@ -104,25 +137,47 @@ class ScoringPanel(ttk.Frame):
                 from dance_scoring.core.extractor import PoseExtractor, download_model
                 from dance_scoring.core.scorer import Scorer
                 from dance_scoring.core.config import Config
-                download_model()
+
+                with guard("下载模型"):
+                    download_model()
                 cfg = Config(score_threshold=threshold)
 
-                # 每个视频用独立的 PoseExtractor，确保 MediaPipe 时间戳从 0 开始
                 _progress(15, "提取参考视频姿态...")
-                ref = PoseExtractor(cfg).extract(self._ref_path)
+                with guard("提取参考姿态"):
+                    ref = PoseExtractor(cfg).extract(ref_path)
+                log.debug(f"参考姿态: {len(ref)} 帧")
+
                 _progress(45, "提取用户视频姿态...")
-                user = PoseExtractor(cfg).extract(self._user_path)
+                with guard("提取用户姿态"):
+                    user = PoseExtractor(cfg).extract(user_path)
+                log.debug(f"用户姿态: {len(user)} 帧")
+
+                # 强制 GC 释放 MediaPipe C++ 对象，避免和 optimum-intel 冲突
+                import gc; gc.collect()
 
                 _progress(70, "DTW对齐+打分...")
-                scorer = Scorer(cfg, bpm=bpm, alignment_method=self.var_algo.get())
-                overall, segs, low, path = scorer.score(ref, user)
+                with guard("创建纠正提供者"):
+                    try:
+                        from dance_scoring.core.correction_provider import create_correction_provider
+                        hub = self._find_hub()
+                        model = getattr(hub, 'selected_model', '3b') if hub else '3b'
+                        corr = create_correction_provider(correction_backend, model=model)
+                        log.info(f"纠正后端: {corr.provider_name}")
+                    except Exception as e:
+                        log.warning(f"LLM 纠正不可用，回退规则引擎: {e}")
+                        corr = None
+
+                scorer = Scorer(cfg, bpm=bpm, alignment_method=algo)
+                overall, segs, low, path = scorer.score(
+                    ref, user, correction_provider=corr,
+                )
+                log.info(f"评分完成: overall={overall:.1f}")
 
                 _progress(95, "保存结果...")
                 self._scoring = False
 
-                # 保存到 Hub（在主线程中）
                 def _done():
-                    try:
+                    with guard("显示评分结果"):
                         if not self.winfo_exists():
                             return
                         self.progress.pack_forget()
@@ -134,27 +189,30 @@ class ScoringPanel(ttk.Frame):
                                  f"{len(segs)}段合格",
                             font=FONTS["body_bold"])
                         self.lbl_progress.pack()
-                        # 存到 Hub
+
+                        corrections = {}
+                        joint_devs = {}
+                        for s in segs:
+                            if s.get('correction_text'):
+                                corrections[s['id']] = s['correction_text']
+                            if s.get('deviations'):
+                                joint_devs[s['id']] = s['deviations']
+
                         for c in self.winfo_toplevel().winfo_children():
                             if hasattr(c, 'set_score_result'):
-                                c.set_score_result(overall, segs, threshold,
-                                                  ref_path=self._ref_path or "",
-                                                  user_path=self._user_path or "")
+                                c.set_score_result(
+                                    overall, segs, threshold,
+                                    ref_path=ref_path or "",
+                                    user_path=user_path or "",
+                                    corrections=corrections,
+                                    joint_devs=joint_devs,
+                                )
                                 c.set_status(f"✅ 评分完成 {overall:.1f}分")
                                 break
-                    except Exception:
-                        pass
 
                 self.master.after(0, _done)
-            except Exception as e:
-                self._scoring = False
-                import traceback
-                err = f"{e}\n{traceback.format_exc()}"
-                print(err)
-                self.master.after(0, lambda: messagebox.showerror("评分失败", err[:300]))
-                self.master.after(0, lambda: self.btn_start.config(state=tk.NORMAL))
 
-        threading.Thread(target=run, daemon=True).start()
+        safe_thread("scoring", run)
 
     def _find_hub(self):
         try:
@@ -184,6 +242,10 @@ class ReviewPanel(ttk.Frame):
         super().__init__(master)
         self._hub = None
         self._seg_widgets = []
+        # 对话状态
+        self._chat_history = []       # [(role, text), ...]
+        self._chat_llm = None         # 懒加载的 LLMProvider 引用
+        self._chat_sending = False    # 防止重复发送
         self._build()
 
     def _build(self):
@@ -219,22 +281,28 @@ class ReviewPanel(ttk.Frame):
         return None
 
     def _try_load(self, retry=0):
-        self._hub = self._find_hub()
-        data = None
-        if self._hub is not None:
-            data = getattr(self._hub, 'last_score_result', None)
-        if data and data.get('segs'):
-            self._load_result(data)
-        elif retry < 5:
-            # Hub 还没准备好或数据还没写入，延迟重试
-            self.after(500, lambda: self._try_load(retry + 1))
+        with guard(f"加载评分结果 (第{retry+1}次)"):
+            self._hub = self._find_hub()
+            data = None
+            if self._hub is not None:
+                data = getattr(self._hub, 'last_score_result', None)
+            if data and data.get('segs'):
+                self._load_result(data)
+            elif retry < 5:
+                safe_after(self, "重试加载", 500, self._try_load, retry + 1)
 
     def _load_result(self, data: dict):
         """加载评分结果数据。"""
-        for w in self.seg_list_frame.winfo_children():
-            w.destroy()
-        for w in self.detail_frame.winfo_children():
-            w.destroy()
+        with guard("渲染回顾面板"):
+            for w in self.seg_list_frame.winfo_children():
+                w.destroy()
+            for w in self.detail_frame.winfo_children():
+                w.destroy()
+            if hasattr(self, '_chat_frame') and self._chat_frame is not None:
+                try:
+                    self._chat_frame.destroy()
+                except Exception:
+                    pass
 
         segs = data.get('segs', [])
         threshold = data.get('threshold', 60)
@@ -276,6 +344,9 @@ class ReviewPanel(ttk.Frame):
         ttk.Button(btn_frame, text="🔄 刷新",
                   command=self._try_load,
                   bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
+
+        # ── AI 舞蹈教练对话窗口 ──
+        self._build_chat(data)
 
     def _show_seg_detail(self, seg: dict, threshold: float):
         """显示某段的详细信息：得分、时间、纠正建议、练习视频入口。"""
@@ -361,6 +432,222 @@ class ReviewPanel(ttk.Frame):
                   command=lambda: _open_output_dir("output/low_score_clips"),
                   bootstyle="secondary-outline").pack(anchor=tk.W, pady=(4, 0))
 
+    # ── AI 舞蹈教练对话 ──
+
+    def _build_chat(self, data: dict):
+        """在回顾面板底部构建 AI 对话窗口。"""
+        # 清除旧对话历史和子进程
+        self._chat_history = []
+        if hasattr(self, '_chat_proc') and self._chat_proc and self._chat_proc.poll() is None:
+            try:
+                self._chat_proc.stdin.close()
+                self._chat_proc.wait(timeout=3)
+            except Exception:
+                self._chat_proc.kill()
+        self._chat_proc = None
+
+        # 所有聊天 widget 放入独立 frame，便于清理
+        self._chat_frame = ttk.Frame(self)
+        self._chat_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        # 分隔线
+        ttk.Separator(self._chat_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
+
+        # 标题
+        chat_header = ttk.Frame(self._chat_frame)
+        chat_header.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(chat_header, text="🤖 AI 舞蹈教练",
+                 font=FONTS["body_bold"],
+                 foreground=COLORS["accent"]).pack(side=tk.LEFT)
+        ttk.Label(chat_header, text="向 AI 提问，获取个性化改进建议",
+                 font=FONTS["small"],
+                 foreground=COLORS["text_muted"]).pack(side=tk.LEFT, padx=8)
+
+        # 对话显示区
+        chat_display_frame = ttk.Frame(self._chat_frame)
+        chat_display_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 4))
+
+        self._chat_text = tk.Text(
+            chat_display_frame,
+            height=10,
+            bg=COLORS["input_bg"],
+            fg=COLORS["text"],
+            font=FONTS["body"],
+            relief=tk.FLAT,
+            borderwidth=6,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            insertbackground=COLORS["text"],
+        )
+        chat_scroll = ttk.Scrollbar(
+            chat_display_frame, orient=tk.VERTICAL,
+            command=self._chat_text.yview,
+        )
+        self._chat_text.configure(yscrollcommand=chat_scroll.set)
+        self._chat_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        chat_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 配置对话文本样式
+        self._chat_text.tag_configure(
+            "ai", foreground=COLORS["accent"], font=FONTS["body"],
+        )
+        self._chat_text.tag_configure(
+            "user", foreground=COLORS["success"], font=FONTS["body"],
+        )
+        self._chat_text.tag_configure(
+            "system", foreground=COLORS["text_muted"], font=FONTS["small"],
+        )
+
+        # 输入区
+        input_frame = ttk.Frame(self._chat_frame)
+        input_frame.pack(fill=tk.X)
+
+        self._chat_input = ttk.Entry(input_frame, font=FONTS["body"])
+        self._chat_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self._chat_input.bind("<Return>", self._on_chat_key)
+        self._chat_input.focus_set()
+
+        self._chat_send_btn = ttk.Button(
+            input_frame, text="发送",
+            command=self._send_chat,
+            bootstyle="warning",
+        )
+        self._chat_send_btn.pack(side=tk.RIGHT)
+
+        # 存储评分数据供对话上下文使用
+        self._chat_data = data
+
+        # 显示欢迎消息
+        overall = data.get('overall', 0)
+        segs = data.get('segs', [])
+        fail_count = sum(1 for s in segs if s.get('score', 0) < 60)
+        self._append_chat("system",
+            f"当前评分结果：总分 {overall:.1f}，{len(segs)} 段中 {fail_count} 段不合格。"
+            f"你可以问 AI 关于某个动作的改进方法，或如何针对薄弱部位练习。"
+        )
+
+        # 延迟加载：AI 模型在用户首次提问时才加载
+        self._chat_llm = False  # False = 未加载, True = 已加载
+        self._append_chat("system", "输入问题后 AI 将自动加载模型（首次需约 8 秒）")
+
+    def _on_chat_key(self, event):
+        """Enter 键发送消息。"""
+        self._send_chat()
+        return "break"
+
+    def _send_chat(self):
+        """发送用户消息并获取 AI 回复。"""
+        if self._chat_sending:
+            return
+        user_text = self._chat_input.get().strip()
+        if not user_text:
+            return
+
+        self._chat_sending = True
+        self._chat_input.delete(0, tk.END)
+        self._chat_send_btn.config(state=tk.DISABLED)
+        self._append_chat("user", user_text)
+        log.debug(f"对话消息: {user_text[:50]}...")
+
+        is_first = (self._chat_llm is False)
+        if is_first:
+            self._append_chat("system", "⏳ 首次加载模型约需8秒...")
+
+        chat_data = self._chat_data
+        chat_history = [(r, t) for r, t in self._chat_history[-6:]]
+        chat_history.append(("user", user_text))
+        system_ctx = self._build_chat_system_context(chat_data)
+
+        def _call_ai():
+            with guard("AI对话"):
+                import subprocess as _sp, tempfile as _tf, json as _json, sys as _sys
+                reply = ""
+                try:
+                    data = _json.dumps({'s': system_ctx, 'h': chat_history[:-1], 'u': user_text},
+                                      ensure_ascii=False)
+                    with _tf.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
+                        f.write(data); inp = f.name
+                    script = (
+                        'import sys,json\nsys.path.insert(0,"src")\n'
+                        f'with open({repr(inp)}) as f: d=json.load(f)\n'
+                        'from LLM.my_qwen import Qwen3BProvider\n'
+                        'llm=Qwen3BProvider()\n'
+                        'print(llm.chat(d["s"],d.get("h",[]),d["u"]))\n'
+                    )
+                    r = _sp.run([_sys.executable, '-c', script], capture_output=True,
+                                text=True, timeout=120)
+                    import os; os.unlink(inp)
+                    # 取最后一行非空内容作为回复（过滤加载日志）
+                    lines = [l for l in r.stdout.strip().split('\n') if l.strip()
+                            and not l.startswith('llama_') and '加载' not in l and '✅' not in l]
+                    reply = lines[-1].strip() if lines else ''
+                except Exception:
+                    pass
+                if not reply:
+                    reply = "抱歉，请再说一次。"
+                for prefix in ["教练：", "教练:", "好的，", "好的 "]:
+                    if reply.startswith(prefix):
+                        reply = reply[len(prefix):].strip()
+                self.master.after(0, lambda r=reply: self._append_chat("ai", r))
+            def _on_done():
+                self._chat_sending = False
+                self._chat_llm = True
+                try:
+                    if hasattr(self, '_chat_send_btn') and self._chat_send_btn.winfo_exists():
+                        self._chat_send_btn.config(state=tk.NORMAL)
+                except Exception:
+                    pass
+            self.master.after(0, _on_done)
+
+        safe_thread("chat_call", _call_ai)
+
+    def _build_chat_system_context(self, data: dict) -> str:
+        """构建对话的系统上下文（含薄弱部位记忆）。"""
+        segs = data.get('segs', [])
+        overall = data.get('overall', 0)
+        fail_segs = [s for s in segs if s.get('score', 0) < 60]
+
+        # 收集薄弱部位和各段得分
+        weak_parts = {}
+        for s in fail_segs:
+            for d in (s.get('deviations', []) or [])[:5]:
+                name = d.joint_name
+                if name not in weak_parts or abs(d.deviation_deg) > abs(weak_parts[name]):
+                    weak_parts[name] = d.deviation_deg
+        # 按偏差排序
+        weak_sorted = sorted(weak_parts.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        weak_list = "、".join(f"{n}" for n, _ in weak_sorted) if weak_sorted else "无明显薄弱"
+
+        seg_summary = " ".join(
+            f"段{s['id']}{s['score']:.0f}分" for s in segs
+        )
+
+        return (
+            f"你是真人舞蹈教练，正在和学员一对一聊天指导。\n"
+            f"学员测评：总分{overall:.0f}，{len(fail_segs)}段需改进。{seg_summary}。\n"
+            f"最需关注：{weak_list}。\n"
+            f"规则：用口语化中文，亲切自然像朋友聊天。每次只给1条建议。\n"
+            f"如果学员问具体部位，针对那个部位回答。不要列举数值。不超过50字。"
+        )
+
+    def _append_chat(self, role: str, text: str):
+        """向对话显示区追加一条消息。"""
+        try:
+            self._chat_text.config(state=tk.NORMAL)
+            if role == "user":
+                tag, prefix = "user", "🧑 "
+            elif role == "ai":
+                tag, prefix = "ai", "🤖 "
+            else:
+                tag, prefix = "system", ""
+            self._chat_text.insert(tk.END, f"{prefix}{text}\n\n", tag)
+            self._chat_text.see(tk.END)
+            self._chat_text.config(state=tk.DISABLED)
+            if role in ("user", "ai"):
+                self._chat_history.append((role, text))
+        except Exception as e:
+            log.warning(f"追加对话失败: {e}")
+
     def _show_empty(self):
         ttk.Label(self.detail_frame, text="📁 练习回顾", font=FONTS["heading"],
                  foreground=COLORS["text"]).pack(anchor=tk.W, pady=(0, 8))
@@ -431,26 +718,40 @@ class SplitPanel(ttk.Frame):
         self.lbl_result.pack()
         self.lbl_result.config(text="分割中...")
 
-        def run():
-            import sys
-            sys.path.insert(0, 'scripts')
+        from dance_scoring.gui.worker import SplitWorker
+        log.info(f"开始分割: {path} BPM={bpm}")
+
+        def _on_progress(pct, msg):
             try:
-                from split import split_video
-                segments = split_video(path, bpm)
-                n = len(segments)
-                self.master.after(0, lambda: self.lbl_result.config(
-                    text=f"分段数: {n}\n每段 ~4.0s (8拍)\n输出: output/segments/"))
-                self.master.after(0, lambda: ttk.Button(
+                self.lbl_result.config(text=msg)
+            except Exception:
+                pass
+
+        def _on_done(success, result, error):
+            self._splitting = False
+            try:
+                self.btn_split.config(state=tk.NORMAL)
+            except Exception:
+                pass
+            if success:
+                n = len(result.get('segments', []))
+                self.lbl_result.config(
+                    text=f"✅ 分割完成: {n}段\n方式: {result.get('method','')}\n"
+                         f"BPM: {result.get('bpm',0):.0f}\n输出: output/segments/")
+                ttk.Button(
                     self.result_frame, text="📂 打开分段目录",
                     command=lambda: _open_output_dir("output/segments"),
-                    bootstyle="secondary-outline").pack(pady=4))
-            except Exception as e:
-                self.master.after(0, lambda: messagebox.showerror("分割失败", str(e)))
-            finally:
-                self._splitting = False
-                self.master.after(0, lambda: self.btn_split.config(state=tk.NORMAL))
+                    bootstyle="secondary-outline").pack(pady=4)
+                log.info(f"分割完成: {n}段, {result.get('method','')}")
+            else:
+                log.error(f"分割失败: {error}")
+                messagebox.showerror("分割失败", str(error)[:300])
 
-        threading.Thread(target=run, daemon=True).start()
+        worker = SplitWorker(
+            path, bpm, "output/segments",
+            on_progress=_on_progress, on_done=_on_done,
+        )
+        worker.start()
 
 
 # ============================================================
@@ -717,7 +1018,8 @@ class PerfPanel(ttk.Frame):
                 self.master.after(0, lambda: self.result_text.delete("1.0", tk.END))
                 self.master.after(0, lambda: self.result_text.insert(tk.END, output[-3000:]))
             except Exception as e:
-                self.master.after(0, lambda: self.result_text.insert(tk.END, f"错误: {e}"))
+                err_msg = str(e)
+                self.master.after(0, lambda: self.result_text.insert(tk.END, f"错误: {err_msg}"))
             finally:
                 self._testing = False
 
@@ -738,27 +1040,33 @@ def _open_output_dir(path: str):
         else:
             subprocess.Popen(['xdg-open', full])
     except Exception as e:
-        messagebox.showwarning("提示", f"无法打开目录: {e}")
+        log.warning(f"打开目录失败 [{path}]: {e}")
+        try:
+            messagebox.showwarning("提示", f"无法打开目录: {e}")
+        except Exception:
+            pass
 
 
 def _play_video(path: str):
     """用系统播放器打开视频文件。"""
-    if not os.path.exists(path):
-        messagebox.showinfo("提示", f"文件不存在:\n{os.path.basename(path)}")
-        return
-    # 依次尝试常见播放器
-    for player in ['vlc', 'mpv', 'ffplay', 'totem', 'xdg-open']:
-        try:
-            r = subprocess.run(['which', player], capture_output=True, text=True)
-            if r.returncode == 0:
-                subprocess.Popen([player, path],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
-                return
-        except Exception:
-            continue
-    # 最后兜底：xdg-open 打开包含文件的目录
     try:
+        if not os.path.exists(path):
+            messagebox.showinfo("提示", f"文件不存在:\n{os.path.basename(path)}")
+            return
+        for player in ['vlc', 'mpv', 'ffplay', 'totem', 'xdg-open']:
+            try:
+                r = subprocess.run(['which', player], capture_output=True, text=True)
+                if r.returncode == 0:
+                    subprocess.Popen([player, path],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+                    return
+            except Exception:
+                continue
         subprocess.Popen(['xdg-open', os.path.dirname(path)])
     except Exception as e:
-        messagebox.showwarning("提示", f"无法播放视频: {e}")
+        log.warning(f"播放视频失败 [{path}]: {e}")
+        try:
+            messagebox.showwarning("提示", f"无法播放视频: {e}")
+        except Exception:
+            pass
