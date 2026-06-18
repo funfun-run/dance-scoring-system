@@ -27,6 +27,28 @@ class PoseExtractor:
         )
         self.det = vision.PoseLandmarker.create_from_options(opt)
         self.cfg = cfg
+        self._closed = False
+
+    def close(self):
+        """显式关闭底层 MediaPipe Landmarker，释放 C++ 资源。
+
+        必须在创建 PoseExtractor 的同一线程调用，避免 llvmpipe 崩溃。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if hasattr(self.det, 'close'):
+                self.det.close()
+        except Exception as e:
+            print(f"[WARN] PoseExtractor.close() 失败: {e}")
+
+    def __del__(self):
+        """析构保护：尝试关闭但不应依赖此机制（__del__ 在 llvmpipe 上不可靠）。"""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def extract(self, path: str, progress_callback=None) -> List[PoseFrame]:
         cap = cv2.VideoCapture(path)

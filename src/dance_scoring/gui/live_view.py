@@ -1133,4 +1133,9 @@ class LiveApp(ttk.Toplevel):
     def _on_close(self):
         if hasattr(self, '_panel') and self._panel is not None:
             self._panel._stop()
+        if hasattr(self, 'extractor') and self.extractor is not None:
+            try:
+                self.extractor.close()
+            except Exception:
+                pass
         self.destroy()

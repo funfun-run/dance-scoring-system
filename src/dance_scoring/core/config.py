@@ -36,6 +36,14 @@ SCORE_PENALTY_THRESHOLD = 15.0
 DTW_WINDOW_RATIO = 0.1
 Z_AXIS_WEIGHT = 0.3
 
+# Visibility filtering — 过滤画面外/低置信度关键点
+VISIBILITY_THRESHOLD = 0.5       # MediaPipe landmark visibility 低于此值视为不可见
+MIN_VISIBLE_FRAME_RATIO = 0.3    # 关节在某段中可见帧占比低于此值则跳过评分
+
+# 舞蹈评分排除列表 — 面部关键点（与舞蹈动作无关）
+# 0=鼻尖, 1-6=眼, 7-8=耳, 9-10=嘴角
+DANCE_EXCLUDED_JOINTS = frozenset({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+
 
 @dataclass
 class Config:

@@ -152,13 +152,17 @@ class ScoreWorker(Worker):
                     return
 
                 self._report(0, "提取参考视频姿态...")
-                ref = PoseExtractor(cfg).extract(self.ref_path)
+                ext = PoseExtractor(cfg)
+                ref = ext.extract(self.ref_path)
+                ext.close()  # 同线程显式释放，防止 llvmpipe 析构崩溃
 
                 if self._cancel:
                     return
 
                 self._report(33, "提取用户视频姿态...")
-                user = PoseExtractor(cfg).extract(self.user_path)
+                ext = PoseExtractor(cfg)
+                user = ext.extract(self.user_path)
+                ext.close()
 
                 if self._cancel:
                     return

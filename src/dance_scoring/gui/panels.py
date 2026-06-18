@@ -118,101 +118,118 @@ class ScoringPanel(ttk.Frame):
         self.lbl_progress.pack()
         self.result_frame.pack_forget()
         self.btn_start.config(state=tk.DISABLED)
-        self.progress['value'] = 0
-        self.lbl_progress.config(text="加载模型...")
+        self.progress['mode'] = 'indeterminate'
+        self.progress.start(15)
+        self.lbl_progress.config(text="⏳ 评分中（子进程隔离，约30秒）...")
 
-        log.info(f"开始评分: ref={os.path.basename(ref_path)} user={os.path.basename(user_path)} "
-                 f"algo={algo} correction={correction_backend}")
+        # 读取 Hub 模型选择
+        hub = self._find_hub()
+        model = getattr(hub, 'selected_model', '3b') if hub else '3b'
 
-        def run():
-            with guard("评分流水线"):
-                def _progress(pct, msg):
-                    try:
-                        self.master.after(0, lambda: self.progress.config(value=pct))
-                        self.master.after(0, lambda: self.lbl_progress.config(text=msg))
-                    except Exception:
-                        pass
+        log.info(f"开始评分(子进程): ref={os.path.basename(ref_path)} "
+                 f"user={os.path.basename(user_path)} algo={algo} correction={correction_backend}")
 
-                _progress(10, "加载模型...")
-                from dance_scoring.core.extractor import PoseExtractor, download_model
-                from dance_scoring.core.scorer import Scorer
-                from dance_scoring.core.config import Config
+        def _on_subprocess_done(success, result, error):
+            """子进程完成回调（主线程）。"""
+            with guard("显示评分结果"):
+                self._scoring = False
+                self.progress.stop()
+                self.progress['mode'] = 'determinate'
+                self.progress.pack_forget()
+                self.lbl_progress.pack_forget()
+                try:
+                    self.btn_start.config(state=tk.NORMAL)
+                except Exception:
+                    pass
 
-                with guard("下载模型"):
-                    download_model()
-                cfg = Config(score_threshold=threshold)
+                if not success:
+                    log.error(f"评分子进程失败: {error}")
+                    self.lbl_progress.config(text=f"❌ 评分失败: {error[:100]}")
+                    self.lbl_progress.pack()
+                    messagebox.showerror("评分失败", str(error)[:500])
+                    return
 
-                _progress(15, "提取参考视频姿态...")
-                with guard("提取参考姿态"):
-                    ref = PoseExtractor(cfg).extract(ref_path)
-                log.debug(f"参考姿态: {len(ref)} 帧")
+                overall = result['overall']
+                segs = result['segs']
+                corrections = result.get('corrections', {})
+                joint_devs = result.get('joint_devs', {})
 
-                _progress(45, "提取用户视频姿态...")
-                with guard("提取用户姿态"):
-                    user = PoseExtractor(cfg).extract(user_path)
-                log.debug(f"用户姿态: {len(user)} 帧")
+                # 在 segs 中恢复 Deviation 对象（供 ReviewPanel 使用）
+                from dance_scoring.core.correction_provider import Deviation
+                for s in segs:
+                    s['deviations'] = [Deviation(**d) for d in s.get('deviations', [])]
+                    s['threshold'] = threshold  # 兼容老代码
 
-                # 强制 GC 释放 MediaPipe C++ 对象，避免和 optimum-intel 冲突
-                import gc; gc.collect()
-
-                _progress(70, "DTW对齐+打分...")
-                with guard("创建纠正提供者"):
-                    try:
-                        from dance_scoring.core.correction_provider import create_correction_provider
-                        hub = self._find_hub()
-                        model = getattr(hub, 'selected_model', '3b') if hub else '3b'
-                        corr = create_correction_provider(correction_backend, model=model)
-                        log.info(f"纠正后端: {corr.provider_name}")
-                    except Exception as e:
-                        log.warning(f"LLM 纠正不可用，回退规则引擎: {e}")
-                        corr = None
-
-                scorer = Scorer(cfg, bpm=bpm, alignment_method=algo)
-                overall, segs, low, path = scorer.score(
-                    ref, user, correction_provider=corr,
-                )
                 log.info(f"评分完成: overall={overall:.1f}")
 
-                _progress(95, "保存结果...")
-                self._scoring = False
+                self.lbl_progress.config(
+                    text=f"✅ 评分完成！总评 {overall:.1f}/100  "
+                         f"{sum(1 for s in segs if s['score']>=threshold)}/"
+                         f"{len(segs)}段合格",
+                    font=FONTS["body_bold"])
+                self.lbl_progress.pack()
 
-                def _done():
-                    with guard("显示评分结果"):
-                        if not self.winfo_exists():
-                            return
-                        self.progress.pack_forget()
-                        self.lbl_progress.pack_forget()
-                        self.btn_start.config(state=tk.NORMAL)
-                        self.lbl_progress.config(
-                            text=f"✅ 评分完成！总评 {overall:.1f}/100  "
-                                 f"{sum(1 for s in segs if s['score']>=threshold)}/"
-                                 f"{len(segs)}段合格",
-                            font=FONTS["body_bold"])
-                        self.lbl_progress.pack()
+                for c in self.winfo_toplevel().winfo_children():
+                    if hasattr(c, 'set_score_result'):
+                        c.set_score_result(
+                            overall, segs, threshold,
+                            ref_path=ref_path or "",
+                            user_path=user_path or "",
+                            corrections=corrections,
+                            joint_devs=joint_devs,
+                        )
+                        c.set_status(f"✅ 评分完成 {overall:.1f}分")
+                        break
 
-                        corrections = {}
-                        joint_devs = {}
-                        for s in segs:
-                            if s.get('correction_text'):
-                                corrections[s['id']] = s['correction_text']
-                            if s.get('deviations'):
-                                joint_devs[s['id']] = s['deviations']
+        safe_thread("score_subprocess", self._run_score_subprocess,
+                    ref_path=ref_path, user_path=user_path, bpm=bpm,
+                    threshold=threshold, algo=algo,
+                    correction_backend=correction_backend, model=model,
+                    on_done=_on_subprocess_done)
 
-                        for c in self.winfo_toplevel().winfo_children():
-                            if hasattr(c, 'set_score_result'):
-                                c.set_score_result(
-                                    overall, segs, threshold,
-                                    ref_path=ref_path or "",
-                                    user_path=user_path or "",
-                                    corrections=corrections,
-                                    joint_devs=joint_devs,
-                                )
-                                c.set_status(f"✅ 评分完成 {overall:.1f}分")
-                                break
+    def _run_score_subprocess(self, ref_path, user_path, bpm, threshold, algo,
+                              correction_backend, model, on_done):
+        """在后台线程中运行评分子进程，完成后回调主线程。"""
+        with guard("评分子进程"):
+            import subprocess as _sp, json as _json, sys as _sys, os as _os
+            success = False
+            result = None
+            error = ""
+            try:
+                bridge = _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
+                                       "scripts", "score_bridge.py")
+                bridge = _os.path.normpath(bridge)
+                cmd = [
+                    _sys.executable, bridge,
+                    "--ref", ref_path,
+                    "--user", user_path,
+                    "--threshold", str(threshold),
+                    "--bpm", str(bpm),
+                    "--algo", algo,
+                    "--correction", correction_backend,
+                    "--model", model,
+                ]
+                r = _sp.run(cmd, capture_output=True, text=True, timeout=180,
+                           cwd=_os.getcwd())
+                output = r.stdout.strip()
+                if not output:
+                    error = f"子进程无输出。stderr: {r.stderr[:300]}"
+                else:
+                    data = _json.loads(output)
+                    if data.get("success"):
+                        success = True
+                        result = data
+                    else:
+                        error = data.get("error", "未知错误")
+            except _sp.TimeoutExpired:
+                error = "评分超时（>3分钟）"
+            except Exception as e:
+                error = str(e)
 
-                self.master.after(0, _done)
-
-        safe_thread("scoring", run)
+            # 回调主线程
+            def _callback():
+                on_done(success, result, error)
+            self.master.after(0, _callback)
 
     def _find_hub(self):
         try:
@@ -298,11 +315,14 @@ class ReviewPanel(ttk.Frame):
                 w.destroy()
             for w in self.detail_frame.winfo_children():
                 w.destroy()
-            if hasattr(self, '_chat_frame') and self._chat_frame is not None:
-                try:
-                    self._chat_frame.destroy()
-                except Exception:
-                    pass
+            for attr in ('_chat_frame', '_chat_hint_frame'):
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    try:
+                        obj.destroy()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
 
         segs = data.get('segs', [])
         threshold = data.get('threshold', 60)
@@ -345,25 +365,76 @@ class ReviewPanel(ttk.Frame):
                   command=self._try_load,
                   bootstyle="secondary-outline").pack(side=tk.LEFT, padx=2)
 
-        # ── AI 舞蹈教练对话窗口 ──
-        self._build_chat(data)
+        # ── AI 聊天：延迟到用户首次输入时才构建 ──
+        self._chat_data = data
+        self._chat_llm = False
+        self._chat_history = []
+        self._chat_frame = None
+        # 显示提示
+        self._show_chat_hint()
 
     def _show_seg_detail(self, seg: dict, threshold: float):
         """显示某段的详细信息：得分、时间、纠正建议、练习视频入口。"""
-        for w in self.detail_frame.winfo_children():
-            w.destroy()
+        if not self.winfo_exists():
+            return
+        with guard(f"显示段{seg.get('id', '?')}详情"):
+            try:
+                self._do_show_seg_detail(seg, threshold)
+            except Exception as e:
+                log.error(f"段详情渲染失败: {e}")
+                # 降级：显示简化版
+                try:
+                    for w in self.detail_frame.winfo_children():
+                        w.destroy()
+                    ttk.Label(self.detail_frame,
+                             text=f"段 {seg.get('id', '?')} 得分 {seg.get('score', 0):.1f}",
+                             font=FONTS["body"]).pack(anchor=tk.W)
+                except Exception:
+                    pass
 
+    def _do_show_seg_detail(self, seg: dict, threshold: float):
+        """实际渲染段详情（由 _show_seg_detail 安全调用）。"""
+        # 先收集所有数据（在 widget 操作前，避免中间状态）
         passed = seg['score'] >= threshold
         color = COLORS["success"] if passed else COLORS["danger"]
         icon = "✅" if passed else "❌"
+        seg_id = seg['id']
+        score = seg['score']
+        start_t = seg['start_time']
+        end_t = seg['end_time']
+
+        corr_text = seg.get('correction_text', '')
+        if not corr_text:
+            hub_data = self._hub.last_score_result if self._hub else {}
+            corrections = hub_data.get('corrections', {})
+            corr_text = corrections.get(seg_id, '')
+
+        if corr_text and corr_text.startswith(f"第{seg_id}段："):
+            corr_text = corr_text[len(f"第{seg_id}段："):]
+        correction_lines = [l.strip() for l in corr_text.split('；') if l.strip()] if corr_text else []
+
+        # 查找练习视频
+        clip_name = f"practice_seg{seg_id:02d}_score{score:.0f}_slow.mp4"
+        clip_path = os.path.join(os.getcwd(), "output", "low_score_clips", clip_name)
+        seg_path = os.path.join(os.getcwd(), "output", "segments",
+                               f"ref_seg_{seg_id:02d}_slow.mp4")
+        found_paths = []
+        if os.path.exists(clip_path):
+            found_paths.append(("低分练习视频 (慢动作 0.8x)", clip_path))
+        if os.path.exists(seg_path):
+            found_paths.append(("分段慢动作视频 (0.8x)", seg_path))
+
+        # ── 现在安全地更新 UI ──
+        for w in self.detail_frame.winfo_children():
+            w.destroy()
 
         # 段标题
         ttk.Label(self.detail_frame,
-                 text=f"{icon} 第 {seg['id']} 段",
+                 text=f"{icon} 第 {seg_id} 段",
                  font=FONTS["heading"]).pack(anchor=tk.W, pady=(0, 4))
         ttk.Label(self.detail_frame,
-                 text=f"得分: {seg['score']:.1f}  |  "
-                      f"时间: {seg['start_time']:.1f}s - {seg['end_time']:.1f}s",
+                 text=f"得分: {score:.1f}  |  "
+                      f"时间: {start_t:.1f}s - {end_t:.1f}s",
                  font=FONTS["body"],
                  foreground=color).pack(anchor=tk.W, pady=(0, 12))
 
@@ -371,44 +442,21 @@ class ReviewPanel(ttk.Frame):
         ttk.Label(self.detail_frame, text="── 纠正建议 ──",
                  font=FONTS["body_bold"]).pack(anchor=tk.W, pady=(0, 6))
 
-        corr_text = seg.get('correction_text', '')
-        if not corr_text:
-            # 从 Hub 数据生成纠正建议
-            hub_data = self._hub.last_score_result if self._hub else {}
-            corrections = hub_data.get('corrections', {})
-            corr_text = corrections.get(seg['id'], '')
-
-        if corr_text:
-            if corr_text.startswith(f"第{seg['id']}段："):
-                corr_text = corr_text[len(f"第{seg['id']}段："):]
-            for line in corr_text.split('；'):
-                line = line.strip()
-                if line:
-                    ttk.Label(self.detail_frame, text=f"⚡ {line}",
-                             font=FONTS["body"], wraplength=400,
-                             foreground=COLORS["warning"]).pack(anchor=tk.W, pady=2)
+        if correction_lines:
+            for line in correction_lines:
+                ttk.Label(self.detail_frame, text=f"⚡ {line}",
+                         font=FONTS["body"], wraplength=400,
+                         foreground=COLORS["warning"]).pack(anchor=tk.W, pady=2)
         else:
             ttk.Label(self.detail_frame, text="该段达标，无特别建议 ✨",
                      font=FONTS["body"],
                      foreground=COLORS["text_secondary"]).pack(anchor=tk.W)
 
         # 练习视频
-        ttk.Separator(self.detail_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
-        ttk.Label(self.detail_frame, text="── 练习视频 ──",
-                 font=FONTS["body_bold"]).pack(anchor=tk.W, pady=(0, 6))
-
-        clip_name = f"practice_seg{seg['id']:02d}_score{seg['score']:.0f}_slow.mp4"
-        clip_path = os.path.join(os.getcwd(), "output", "low_score_clips", clip_name)
-        seg_path = os.path.join(os.getcwd(), "output", "segments",
-                               f"ref_seg_{seg['id']:02d}_slow.mp4")
-
-        found_paths = []
-        if os.path.exists(clip_path):
-            found_paths.append(("低分练习视频 (慢动作 0.8x)", clip_path))
-        if os.path.exists(seg_path):
-            found_paths.append(("分段慢动作视频 (0.8x)", seg_path))
-
         if found_paths:
+            ttk.Separator(self.detail_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
+            ttk.Label(self.detail_frame, text="── 练习视频 ──",
+                     font=FONTS["body_bold"]).pack(anchor=tk.W, pady=(0, 6))
             for label, p in found_paths:
                 fsize = os.path.getsize(p) / 1024
                 frm = ttk.Frame(self.detail_frame)
@@ -434,8 +482,22 @@ class ReviewPanel(ttk.Frame):
 
     # ── AI 舞蹈教练对话 ──
 
+    def _ensure_chat(self):
+        """懒加载：首次使用时才构建 AI 聊天 UI，避免 Text widget 干扰段切换。"""
+        if hasattr(self, '_chat_frame') and self._chat_frame is not None:
+            if self._chat_frame.winfo_exists():
+                return
+        self._build_chat(self._chat_data)
+
     def _build_chat(self, data: dict):
         """在回顾面板底部构建 AI 对话窗口。"""
+        # 先销毁提示按钮
+        if hasattr(self, '_chat_hint_frame') and self._chat_hint_frame is not None:
+            try:
+                self._chat_hint_frame.destroy()
+            except Exception:
+                pass
+            self._chat_hint_frame = None
         # 清除旧对话历史和子进程
         self._chat_history = []
         if hasattr(self, '_chat_proc') and self._chat_proc and self._chat_proc.poll() is None:
@@ -532,11 +594,26 @@ class ReviewPanel(ttk.Frame):
 
     def _on_chat_key(self, event):
         """Enter 键发送消息。"""
+        self._ensure_chat()
         self._send_chat()
         return "break"
 
+    def _show_chat_hint(self):
+        """在未加载聊天时显示提示按钮。"""
+        self._chat_hint_frame = ttk.Frame(self)
+        self._chat_hint_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Separator(self._chat_hint_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(0, 8))
+        hint_btn = ttk.Button(
+            self._chat_hint_frame,
+            text="🤖 打开 AI 舞蹈教练 (首次约8秒)",
+            command=self._ensure_chat,
+            bootstyle="warning-outline",
+        )
+        hint_btn.pack(anchor=tk.W)
+
     def _send_chat(self):
         """发送用户消息并获取 AI 回复。"""
+        self._ensure_chat()  # 确保聊天 UI 已构建
         if self._chat_sending:
             return
         user_text = self._chat_input.get().strip()

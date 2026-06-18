@@ -31,6 +31,7 @@ class SegmentInfo:
     start_time: float                # 起始时间 (秒)
     end_time: float                  # 结束时间 (秒)
     deviations: List[Deviation] = field(default_factory=list)
+    skipped_joints: List[str] = field(default_factory=list)  # 可见帧不足被跳过的关节
     correction_text: str = ""        # 纠正文本（由 Provider 填充）
 
 
@@ -83,23 +84,46 @@ class RuleBasedProvider:
         overall_score: float,
         bpm: float,
     ) -> str:
-        """使用规则模板生成纠正文本。"""
+        """使用规则模板生成纠正文本。自动排除不可见关节。"""
         from .correction import _format_correction
 
         if segment.qualified:
             return ""
 
         if not segment.deviations:
+            # 如果没有偏差数据，但有关节被跳过，提醒用户
+            if segment.skipped_joints:
+                return self._skipped_hint(segment)
+            return ""
+
+        # 过滤掉不可见关节的偏差
+        skipped_set = set(segment.skipped_joints) if segment.skipped_joints else set()
+        visible_devs = [d for d in segment.deviations
+                        if d.joint_name not in skipped_set]
+
+        if not visible_devs:
+            if segment.skipped_joints:
+                return self._skipped_hint(segment)
             return ""
 
         corrections = []
-        for d in segment.deviations[:3]:  # Top-3
+        for d in visible_devs[:3]:  # Top-3
             text = _format_correction(d.joint_idx, d.deviation_deg, d.direction)
             corrections.append(text)
 
-        if corrections:
-            return f"第{segment.id}段：" + "；".join(corrections)
-        return ""
+        result = f"第{segment.id}段：" + "；".join(corrections)
+
+        # 如果有跳过的关节，附加提醒
+        if segment.skipped_joints:
+            result += " " + self._skipped_hint(segment)
+
+        return result
+
+    def _skipped_hint(self, segment: SegmentInfo) -> str:
+        """生成不可见关节的提醒文本。"""
+        names = segment.skipped_joints[:3]
+        suffix = "等" if len(segment.skipped_joints) > 3 else ""
+        return f"（⚠️ {', '.join(names)}{suffix}未入镜，评分已跳过）"
 
     @property
     def provider_name(self) -> str:
