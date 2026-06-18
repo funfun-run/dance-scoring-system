@@ -109,7 +109,14 @@ def main():
             "ref_frames": len(ref),
             "user_frames": len(user),
         }
-        json.dump(result, sys.stdout, ensure_ascii=False)
+        class _NumpyEncoder(json.JSONEncoder):
+            def default(self, o):
+                import numpy as np
+                if isinstance(o, (np.floating, np.integer)):
+                    return float(o)
+                return super().default(o)
+
+        json.dump(result, sys.stdout, ensure_ascii=False, cls=_NumpyEncoder)
         sys.stdout.flush()
 
     except Exception:

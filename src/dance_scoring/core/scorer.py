@@ -8,7 +8,7 @@ from .config import (
     Config, DEFAULT_BPM, BEATS_PER_SEGMENT, SCORE_TOLERANCE, SCORE_PENALTY_SMALL,
     SCORE_PENALTY_LARGE, SCORE_PENALTY_THRESHOLD, DTW_WINDOW_RATIO, ANGLE_WEIGHTS,
     ANGLE_JOINTS, PASS_SCORE, VISIBILITY_THRESHOLD, MIN_VISIBLE_FRAME_RATIO,
-    DANCE_EXCLUDED_JOINTS,
+    DANCE_EXCLUDED_JOINTS, COVERAGE_FLOOR, MOTION_FLOOR,
 )
 from .dtw import dtw_constrained
 from .alignment import fastdtw_alignment
@@ -90,48 +90,81 @@ class Scorer:
         if progress_callback: progress_callback(0, "逐帧评分...")
         print("  [2/3] 逐帧评分...")
         fs = []
-        # 逐帧记录每个关节的原始角度差（未加权、未取绝对值，保留方向）
+        # 逐帧记录每个关节的原始角度差 + 加权平均偏差（用于异常帧检测）
         n_angles = len(ANGLE_JOINTS)
-        frame_joint_diffs = []  # List[np.ndarray of shape (n_angles,)]
-        frame_visibility = []   # List[np.ndarray of shape (n_angles,)] bool
+        frame_ang_diffs = []   # 逐帧的加权平均偏差值
+        frame_joint_diffs = []
+        frame_visibility = []
         for ri, ui in path:
-            raw_diffs = ref[ri].angles - user[ui].angles  # (n_angles,)
-            # 检查每个角度的 3 个关键点在 ref 和 user 帧中是否都可见
-            vis_mask = np.zeros(n_angles, dtype=bool)
+            raw_diffs = ref[ri].angles - user[ui].angles
+            ref_vis = np.zeros(n_angles, dtype=bool)
+            both_vis = np.zeros(n_angles, dtype=bool)
             for j, (a, b, c) in enumerate(ANGLE_JOINTS):
-                # 面部关节永远排除
                 if b in DANCE_EXCLUDED_JOINTS:
                     continue
-                if all(ref[ri].conf[idx] >= VISIBILITY_THRESHOLD and
-                       user[ui].conf[idx] >= VISIBILITY_THRESHOLD
-                       for idx in (a, b, c)):
-                    vis_mask[j] = True
-            # 不可见的角度记为 NaN，不参与该帧评分
+                ref_ok = all(ref[ri].conf[idx] >= VISIBILITY_THRESHOLD
+                            for idx in (a, b, c))
+                if ref_ok:
+                    ref_vis[j] = True
+                    if all(user[ui].conf[idx] >= VISIBILITY_THRESHOLD
+                           for idx in (a, b, c)):
+                        both_vis[j] = True
             safe_diffs = raw_diffs.copy()
-            safe_diffs[~vis_mask] = np.nan
+            safe_diffs[~both_vis] = np.nan
             frame_joint_diffs.append(safe_diffs)
-            frame_visibility.append(vis_mask)
-            # 该帧评分仅基于可见角度
-            if vis_mask.any():
+            frame_visibility.append(both_vis)
+            if both_vis.any():
                 effective_weights = ANGLE_WEIGHTS.copy()
-                effective_weights[~vis_mask] = 0.0
-                weight_sum = effective_weights.sum()
-                ang_diff = (np.nansum(np.abs(safe_diffs) * effective_weights) / weight_sum
-                            if weight_sum > 0 else 0.0)
+                effective_weights[~both_vis] = 0.0
+                both_weight = effective_weights.sum()
+                ang_diff = (np.nansum(np.abs(safe_diffs) * effective_weights) / both_weight
+                            if both_weight > 0 else 0.0)
+                ref_weight = float(sum(ANGLE_WEIGHTS[j] for j in range(n_angles)
+                                      if ref_vis[j]))
+                coverage = both_weight / max(ref_weight, 1e-6) if ref_weight > 0 else 1.0
+                coverage_factor = COVERAGE_FLOOR + (1.0 - COVERAGE_FLOOR) * coverage
             else:
-                ang_diff = 0.0  # 极端情况：所有角度都不可见
-            fs.append(self._nonlinear_score(ang_diff))
+                ang_diff = 0.0
+                coverage_factor = COVERAGE_FLOOR
+            frame_ang_diffs.append(ang_diff)
+            raw_score = self._nonlinear_score(ang_diff)
+            fs.append(raw_score * coverage_factor)
+
+        # —— 异常帧检测：片尾 logo / 非舞蹈内容 ——
+        # 如果一帧的加权平均偏差超过全局中位数的 2 倍（且≥30°），标记为异常
+        _diffs = np.array(frame_ang_diffs)
+        _median_diff = float(np.median(_diffs[_diffs > 0])) if (_diffs > 0).any() else 10.0
+        _outlier_threshold = max(_median_diff * 2.0, 30.0)
+        outlier_count = 0
+        for i in range(len(fs)):
+            if frame_ang_diffs[i] > _outlier_threshold:
+                fs[i] = np.nan
+                outlier_count += 1
+        if outlier_count > 0:
+            print(f"  ⚡ 检测到 {outlier_count} 个异常帧（偏差>{_outlier_threshold:.0f}°），已自动排除")
 
         if progress_callback: progress_callback(0, "分段评分...")
         print("  [3/3] 八拍分段评分...")
         segs = seg_by_beats(ref, path, fs, self.cfg.target_fps, self.bpm)
 
-        # —— 逐段聚合关节偏差 ——
+        # —— 构建 ref 帧 → 路径位置的映射 ——
         ref_to_idx = {}
         for idx, (ri, ui) in enumerate(path):
             if ri not in ref_to_idx:
                 ref_to_idx[ri] = idx
 
+        # 重新计算段得分（排除 NaN 异常帧）
+        for seg in segs:
+            sf, ef = seg['ref_start'], seg['ref_end']
+            seg_fs = []
+            for ri in range(sf, ef):
+                if ri in ref_to_idx:
+                    seg_fs.append(fs[ref_to_idx[ri]])
+            if seg_fs:
+                valid = [s for s in seg_fs if not np.isnan(s)]
+                seg['score'] = round(np.mean(valid), 1) if valid else 0.0
+
+        # —— 逐段聚合关节偏差（同时排除异常帧） ——
         for seg in segs:
             sf, ef = seg['ref_start'], seg['ref_end']
             seg_diffs = []       # 偏差 (含 NaN)
@@ -194,6 +227,24 @@ class Scorer:
             seg['skipped_joints'] = all_skipped
             seg['joint_visibility'] = joint_visibility
 
+        # —— 动作幅度惩罚：用户几乎不动则大幅扣分 ——
+        # 计算对齐后 pose 向量的方差，衡量动作幅度
+        ref_aligned = np.array([ref[ri].vec for ri, _ in path])
+        user_aligned = np.array([user[ui].vec for _, ui in path])
+        ref_var = float(np.var(ref_aligned))
+        user_var = float(np.var(user_aligned))
+        # motion_ratio: 0=完全静止, 1=和参考一样活跃, >1=比参考还活跃
+        motion_ratio = user_var / max(ref_var, 1e-8)
+        # 如果用户动作幅度 < 参考的 30%，开始扣分
+        motion_factor = MOTION_FLOOR + (1.0 - MOTION_FLOOR) * min(motion_ratio / 0.3, 1.0)
+        motion_factor = max(MOTION_FLOOR, min(1.0, motion_factor))
+
+        # 对逐帧分和段分统一施加动作惩罚
+        for i in range(len(fs)):
+            fs[i] = fs[i] * motion_factor
+        for seg in segs:
+            seg['score'] = seg['score'] * motion_factor
+
         # 先计算总分，再生成纠正文本（总分是 Prompt 的上下文）
         overall = self._grade_overall(fs, segs)
 
@@ -217,30 +268,42 @@ class Scorer:
         return overall, segs, low, path
 
     def _grade_overall(self, fs, segs):
+        # 总体分 = 各段得分的加权平均（段长不一，用逐帧分做加权）
+        if not segs:
+            return 0.0
+
+        # 按段计算平均分
+        seg_scores = [s['score'] for s in segs]
+        seg_avg = sum(seg_scores) / len(seg_scores)
+
+        # 帧级统计用于评级
         n = len(fs)
-        ok_ratio = sum(1 for s in fs if s >= 60) / n
-        bad_ratio = sum(1 for s in fs if s < 40) / n
-        good_ratio = sum(1 for s in fs if s >= 85) / n
+        ok_ratio = sum(1 for s in fs if s >= 60) / max(n, 1)
+        bad_ratio = sum(1 for s in fs if s < 40) / max(n, 1)
+        good_ratio = sum(1 for s in fs if s >= 85) / max(n, 1)
 
         fail_segs = [s for s in segs if s['score'] < PASS_SCORE]
         if fail_segs:
             print(f"  ⚠️ {len(fail_segs)}/{len(segs)}段不合格 (<{PASS_SCORE:.0f}分)")
 
-        if ok_ratio < 0.6:
-            final = max(3, np.mean(fs)*0.6 - bad_ratio*20)
-            grade = "❌不合格"
-        elif good_ratio >= 0.7 and bad_ratio < 0.03:
-            final = min(100, np.mean(fs)+5)
-            grade = "⭐优秀"
-        elif ok_ratio >= 0.6 and bad_ratio < 0.12:
-            final = np.mean(fs)
-            grade = "👍良好"
-        elif bad_ratio >= 0.25:
-            final = max(3, 15 - bad_ratio*30)
-            grade = "💪需重练"
+        # 总评 = 段均分 × 帧一致性修正
+        if bad_ratio > 0.5:
+            final = seg_avg * 0.7  # 超过半数帧不及格，扣30%
+        elif bad_ratio > 0.3:
+            final = seg_avg * 0.85  # 超过30%帧不及格，扣15%
         else:
-            final = max(3, np.mean(fs) - bad_ratio*25)
+            final = seg_avg
+
+        if final >= 85:
+            grade = "⭐优秀"
+        elif final >= 70:
+            grade = "👍良好"
+        elif final >= 60:
+            grade = "✅合格"
+        elif final >= 40:
             grade = "⚠️需改进"
+        else:
+            grade = "💪需重练"
 
         final = round(max(3, min(100, final)), 1)
         print(f"  总评: {grade} → {final:.1f}分")

@@ -364,18 +364,32 @@ class LiveWorker(threading.Thread):
         qualified = sum(1 for r in self.seg_results if r.get('qualified') == '合格')
         total = len(self.seg_results)
 
-        # 汇总关节偏差（绝对值平均）
+        # 汇总关节偏差（使用 Deviation 对象，已过滤可见性+面部）
         all_joint_sums: Dict[int, float] = {}
         all_joint_counts: Dict[int, int] = {}
         all_corrections: List[str] = []
+        all_skipped: Dict[str, int] = {}  # 跨段频繁跳过的关节
+
         for r in self.seg_results:
-            devs = r.get('joint_deviations', {})
-            for j, d in devs.items():
-                all_joint_sums[j] = all_joint_sums.get(j, 0.0) + abs(d)
-                all_joint_counts[j] = all_joint_counts.get(j, 0) + 1
+            # 优先使用 Deviation 对象（更准确），回退旧格式
+            deviations = r.get('deviations', [])
+            if deviations:
+                for d in deviations:
+                    all_joint_sums[d.joint_idx] = (
+                        all_joint_sums.get(d.joint_idx, 0.0) + abs(d.deviation_deg))
+                    all_joint_counts[d.joint_idx] = (
+                        all_joint_counts.get(d.joint_idx, 0) + 1)
+            else:
+                # 兼容旧格式
+                devs = r.get('joint_deviations', {})
+                for j, d in devs.items():
+                    all_joint_sums[j] = all_joint_sums.get(j, 0.0) + abs(d)
+                    all_joint_counts[j] = all_joint_counts.get(j, 0) + 1
             corr = r.get('correction_text', '')
             if corr:
                 all_corrections.append(corr)
+            for name in r.get('skipped_joints', []):
+                all_skipped[name] = all_skipped.get(name, 0) + 1
 
         # 找出偏差最大的 TOP5 关节
         joint_avgs = {j: all_joint_sums[j] / max(all_joint_counts[j], 1)
@@ -383,6 +397,10 @@ class LiveWorker(threading.Thread):
         top_joints = sorted(joint_avgs.items(), key=lambda x: x[1], reverse=True)[:5]
         weakest = [(j, d, JOINT_NAMES_CN.get(j, f'关节{j}')) for j, d in top_joints
                    if d > 3.0]
+
+        # 频繁跳过的关节（≥50% 段都跳过）
+        frequent_skipped = [name for name, cnt in all_skipped.items()
+                           if cnt >= max(total // 2, 1)]
 
         # 汇总纠正文本（去重取最相关）
         seen_corr = set()
@@ -400,6 +418,7 @@ class LiveWorker(threading.Thread):
             'total': total,
             'weakest_joints': weakest,
             'corrections': unique_corr[:3],
+            'frequent_skipped': frequent_skipped,
             'seg_results': [{'id': r['segment_id'], 'score': r['score'],
                             'qualified': r['qualified']}
                            for r in self.seg_results],
@@ -409,8 +428,9 @@ class LiveWorker(threading.Thread):
         self.queue.put(summary)
         self._request_ai_plan(summary, weakest, all_corrections)
 
+        skipped_info = f" 跳过:{frequent_skipped}" if frequent_skipped else ""
         print(f"[跟练] 本轮完成: 均分{avg_score:.1f}, {qualified}/{total}合格, "
-              f"薄弱部位: {[w[2] for w in weakest[:3]]}")
+              f"薄弱部位: {[w[2] for w in weakest[:3]]}{skipped_info}")
 
     def _request_ai_plan(self, summary: dict, weakest: list, corrections: list):
         """通过队列将 AI 请求交给主线程执行（避免 LiveWorker 线程中的 OpenVINO/MediaPipe 冲突）。"""
@@ -441,7 +461,6 @@ class LiveWorker(threading.Thread):
         })
 
     def _score_window(self, scorer):
-        from dance_scoring.core.config import ANGLE_JOINTS
         if not self.ref_segs:
             return None
         idx = min(self.current_seg, len(self.ref_segs) - 1)
@@ -451,37 +470,26 @@ class LiveWorker(threading.Thread):
             self.current_seg = min(self.current_seg + 1, len(self.ref_segs) - 1)
             return None
 
-        overall, segs, low, path = scorer.score(ref_seg, self.window)
+        overall, scored_segs, low, path = scorer.score(ref_seg, self.window)
 
-        # 关节偏差
-        joint_sums, joint_counts = {}, {}
-        for ri, ui in path:
-            ra = ref_seg[ri].angles
-            ua = self.window[ui].angles
-            for j, (a, b, c) in enumerate(ANGLE_JOINTS):
-                dev = float(ua[j] - ra[j])
-                for ji in [a, b, c]:
-                    joint_sums[ji] = joint_sums.get(ji, 0.) + dev
-                    joint_counts[ji] = joint_counts.get(ji, 0) + 1
-        devs = {j: joint_sums[j] / max(joint_counts[j], 1) for j in joint_sums}
+        # 直接使用 Scorer 的输出（已含可见性过滤 + 面部排除 + 关节去重 + 纠正文本）
+        scorer_seg = scored_segs[0] if scored_segs else {}
+        deviations = scorer_seg.get('deviations', [])
+        skipped_joints = scorer_seg.get('skipped_joints', [])
+        correction_text = scorer_seg.get('correction_text', '')
+        seg_score = scorer_seg.get('score', 0)
 
-        # 纠正建议
-        from dance_scoring.core.correction import generate_correction
-        class S:
-            pass
-        s = S()
-        s.id = seg['id']
-        s.score = segs[0]['score'] if segs else 0
-        s.joint_deviations = devs
-        corr = generate_correction([s], top_n=3, threshold_deg=10.0)
+        # 保持兼容旧格式的 joint_deviations dict
+        devs = {d.joint_idx: d.deviation_deg for d in deviations}
 
         return {
             'segment_id': seg['id'],
-            'score': segs[0]['score'] if segs else 0,
-            'qualified': ('合格' if (segs[0]['score'] if segs else 0) >= 60
-                          else '不合格'),
+            'score': seg_score,
+            'qualified': '合格' if seg_score >= 60 else '不合格',
             'joint_deviations': devs,
-            'correction_text': corr.get(seg['id'], ''),
+            'deviations': deviations,          # List[Deviation]
+            'skipped_joints': skipped_joints,  # List[str]
+            'correction_text': correction_text,
             'path_length': len(path),
         }
 
@@ -854,6 +862,13 @@ class LivePanel(ttk.Frame):
         else:
             self._sum_corr.config(text="全部段表现良好，继续保持！")
 
+        # 频繁跳过的部位（可见帧不足）
+        frequent_skipped = data.get('frequent_skipped', [])
+        if frequent_skipped:
+            self._sum_weak.config(
+                text=self._sum_weak.cget("text") +
+                f"\n\n⚠️ 未入镜: {'、'.join(frequent_skipped[:5])}")
+
         # AI 训练计划（初始：生成中）
         self._sum_ai_plan.config(
             text="⏳ AI 正在根据本轮数据生成训练计划...",
@@ -1044,7 +1059,7 @@ class LivePanel(ttk.Frame):
         score = data.get('score', 0)
         seg_id = data.get('segment_id', 0)
         corr_text = data.get('correction_text', '')
-        joint_devs = data.get('joint_deviations', {})
+        skipped = data.get('skipped_joints', [])
         score_str = f"{score:.1f}" if score > 0 else "--.-"
 
         self.lbl_segment.config(text=f"段: {seg_id} / {max(self._ref_seg_count,1)}")
@@ -1052,15 +1067,31 @@ class LivePanel(ttk.Frame):
         if corr_text:
             if corr_text.startswith(f"第{seg_id}段："):
                 corr_text = corr_text[len(f"第{seg_id}段："):]
-            self.lbl_correction.config(text=corr_text[:80])
+            # 截断前先去掉可能很长的跳过提示
+            display_text = corr_text[:80]
+            self.lbl_correction.config(text=display_text)
         else:
             self.lbl_correction.config(text="跟练中...")
-        if joint_devs:
+
+        # 薄弱部位：优先使用 Deviation 对象（已过滤可见性+面部）
+        deviations = data.get('deviations', [])
+        if deviations:
             from dance_scoring.core.correction import JOINT_NAMES_CN
-            sd = sorted(joint_devs.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+            sd = sorted(deviations, key=lambda d: abs(d.deviation_deg), reverse=True)[:3]
             self.lbl_weak.config(text="  ".join(
-                f"{'🔴' if abs(d)>10 else '🟡'} {JOINT_NAMES_CN.get(j,f'关节{j}')}"
-                for j, d in sd if abs(d) > 5) or "-")
+                f"{'🔴' if abs(d.deviation_deg)>10 else '🟡'} {d.joint_name}"
+                for d in sd if abs(d.deviation_deg) > 5) or "-")
+        else:
+            # 兼容旧格式
+            joint_devs = data.get('joint_deviations', {})
+            if joint_devs:
+                from dance_scoring.core.correction import JOINT_NAMES_CN
+                sd = sorted(joint_devs.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                self.lbl_weak.config(text="  ".join(
+                    f"{'🔴' if abs(d)>10 else '🟡'} {JOINT_NAMES_CN.get(j,f'关节{j}')}"
+                    for j, d in sd if abs(d) > 5) or "-")
+            else:
+                self.lbl_weak.config(text="-")
 
     def _draw_canvas(self, canvas, frame, tag, data):
         import cv2

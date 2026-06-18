@@ -37,7 +37,8 @@ def seg_by_beats(ref, path, fs, target_fps, bpm):
                 seg_fs.append(fs[ref_to_path[ri]])
 
         if seg_fs:
-            ss = round(np.mean(seg_fs), 1)
+            valid = [s for s in seg_fs if not np.isnan(s)]
+            ss = round(np.mean(valid), 1) if valid else 0.0
         else:
             ss = 0.0
 
